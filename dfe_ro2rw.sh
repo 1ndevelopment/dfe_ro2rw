@@ -293,6 +293,23 @@ dfe_patch_fstab() {
     return ${patched}
 }
 
+dfe_patch_init_rc() {
+    local rc_file="$1"
+    local patched=0
+
+    if [ ! -f "${rc_file}" ]; then
+        return 1
+    fi
+
+    # Remove any DFE-NEO injection markers from previous runs
+    if grep -q "DFE-NEO" "${rc_file}" 2>/dev/null; then
+        sed -i '/DFE-NEO/d' "${rc_file}"
+        patched=1
+    fi
+
+    return ${patched}
+}
+
 dfe_patch_fstabs_in_dir() {
     local target_dir="$1"
     local search_dirs="${target_dir}/vendor/etc ${target_dir}/system/etc ${target_dir}/system/system_ext/etc ${target_dir}/product/etc ${target_dir}/odm/etc ${target_dir}/etc"
@@ -476,14 +493,11 @@ ro2rw_convert_to_rw() {
         case "${fstype}" in
             "erofs")
                 log "  Converting EROFS -> EXT4: ${name}"
-                local size
-                size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                # Add 50MB padding for EXT4 journal, inodes, and DFE changes
-                local new_size=$((size + 50 * 1024 * 1024))  
+                local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
                 local mnt_point="${WORKDIR}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
-                # Try mounting natively first using losetup
+                # Mount or extract the erofs image
                 local loop_dev=""
                 local mounted=0
                 
@@ -510,10 +524,22 @@ ro2rw_convert_to_rw() {
                         continue
                     }
                 fi
+
+                # Get actual uncompressed data size (EROFS is highly compressed)
+                local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
+                [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
+                # Add 25% + 100MB padding for EXT4 journal, inodes, decompression, and DFE changes
+                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.25 + 104857600 }')
                 
                 # Create a raw ext4 image (not sparse) to mount and modify it
                 local raw_img="${extract_dir}/${name%.*}.raw.ext4"
-                make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" 2>&1 | log || true
+                if ! make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" 2>&1 | log; then
+                    log "  Failed to create ext4 image for ${name} (insufficient space or other error)"
+                    umount -fl "${mnt_point}" 2>/dev/null || true
+                    [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
+                    rm -rf "${mnt_point}"
+                    continue
+                fi
                 umount -fl "${mnt_point}" 2>/dev/null || true
                 [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
                 rm -rf "${mnt_point}"
@@ -533,20 +559,20 @@ ro2rw_convert_to_rw() {
                 fi
 
                 local new_img="${extract_dir}/${name%.*}.ext4.img"
-                img2simg "${raw_img}" "${new_img}" 2>&1 | log || ${BB} mv -f "${raw_img}" "${new_img}"
-                rm -f "${raw_img}"
-
-                # Replace original
-                ${BB} mv -f "${new_img}" "${img}"
-                converted=1
-                log "  Converted ${name} to EXT4"
+                if [ -f "${raw_img}" ]; then
+                    img2simg "${raw_img}" "${new_img}" 2>&1 | log || ${BB} mv -f "${raw_img}" "${new_img}"
+                    rm -f "${raw_img}"
+                    # Replace original
+                    ${BB} mv -f "${new_img}" "${img}"
+                    converted=1
+                    log "  Converted ${name} to EXT4"
+                else
+                    log "  Skipping ${name}: raw ext4 image not created"
+                fi
                 ;;
             "f2fs")
                 log "  Handling F2FS: ${name}"
-                local size
-                size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                # Add 50MB padding
-                local new_size=$((size + 50 * 1024 * 1024))
+                local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
                 local mnt_point="${WORKDIR}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
@@ -565,6 +591,12 @@ ro2rw_convert_to_rw() {
                         fi
                     fi
                 fi
+                
+                # Get actual uncompressed size
+                local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
+                [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
+                # Add 10% + 50MB padding
+                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.10 + 52428800 }')
                 
                 if [ ${mounted} -eq 1 ]; then
                     local raw_img="${extract_dir}/${name%.*}.raw.ext4"
@@ -625,8 +657,8 @@ ro2rw_convert_to_rw() {
                 if [ ${needs_tuning} -eq 1 ]; then
                     local size
                     size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                    # Add 50MB padding to ensure make_ext4fs has room
-                    local new_size=$((size + 50 * 1024 * 1024))
+                    # Add 10% + 50MB padding to ensure make_ext4fs has room
+                    local new_size=$(${BB} awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
                     
                     local loop_dev=""
                     local mounted=0
