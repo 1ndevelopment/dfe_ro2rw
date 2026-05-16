@@ -447,24 +447,64 @@ ro2rw_dump_super() {
 
 ro2rw_get_lp_metadata() {
     local super_img="$1"
-    local metadata_file="${WORKDIR}/lp_metadata.txt"
+    # Write metadata to internal storage — SD card (FAT32/exFAT) file redirects
+    # can fail silently, and lpdump output must be reliably writable.
+    local metadata_file="/data/local/tmp/superrw_lp_metadata.txt"
+    mkdir -p "$(dirname "${metadata_file}")"
 
     log "Reading logical partition metadata..."
-    lpdump "${super_img}" > "${metadata_file}" 2>&1 || die "lpdump failed"
+    # Always read from block device directly — avoids SD card fstat issues.
+    # Fall back to image file only if block device is unavailable.
+    local _lpdump_src="${super_img}"
+    if [ -b "${SUPER_BLOCK}" ]; then
+        _lpdump_src="${SUPER_BLOCK}"
+    fi
+
+    # Disable set -e around lpdump so we can handle non-zero exit ourselves
+    set +e
+    lpdump "${_lpdump_src}" > "${metadata_file}" 2>&1
+    local _rc=$?
+    set -e
+
+    if [ ${_rc} -ne 0 ] || [ ! -s "${metadata_file}" ]; then
+        log "lpdump on ${_lpdump_src} failed (rc=${_rc}), trying alternate..."
+        if [ "${_lpdump_src}" = "${SUPER_BLOCK}" ] && [ -f "${super_img}" ]; then
+            set +e
+            lpdump "${super_img}" > "${metadata_file}" 2>&1
+            _rc=$?
+            set -e
+        fi
+        [ ${_rc} -ne 0 ] && die "lpdump failed (rc=${_rc})"
+        [ ! -s "${metadata_file}" ] && die "lpdump produced empty metadata"
+    fi
+
+    log "lpdump metadata size: $(wc -c < "${metadata_file}") bytes"
     cat "${metadata_file}" >> "${LOGFILE}"
+    cp "${metadata_file}" "${WORKDIR}/lp_metadata.txt" 2>/dev/null || true
     echo "${metadata_file}"
 }
 
 ro2rw_extract_partitions() {
     local super_img="$1"
-    local extract_dir="${WORKDIR}/extracted"
-
+    # Extract to internal storage — lpunpack writes many files and SD card
+    # performance/reliability is poor for this operation.
+    local extract_dir="/data/local/tmp/superrw/extracted"
     mkdir -p "${extract_dir}"
 
     log "Extracting partitions from super image..."
-    lpunpack "${super_img}" "${extract_dir}" 2>&1 | log || {
+    # Read from block device directly to avoid SD card fstat issues
+    local _lpu_src="${super_img}"
+    [ -b "${SUPER_BLOCK}" ] && _lpu_src="${SUPER_BLOCK}"
+    lpunpack "${_lpu_src}" "${extract_dir}" 2>&1 | log || {
         log "lpunpack encountered issues, checking extracted files..."
     }
+
+    # Verify at least one partition was extracted
+    local _count
+    _count=$(ls -1 "${extract_dir}"/*.img 2>/dev/null | wc -l)
+    if [ "${_count}" -eq 0 ]; then
+        die "lpunpack produced no partition images in ${extract_dir}"
+    fi
 
     log "Extracted partitions:"
     ls -la "${extract_dir}" >> "${LOGFILE}"
@@ -473,9 +513,24 @@ ro2rw_extract_partitions() {
     echo "${extract_dir}"
 }
 
+ro2rw_get_orig_size() {
+    local name="$1"
+    local sizes_str="$2"
+    for _entry in ${sizes_str}; do
+        local _en="${_entry%%:*}"
+        local _ev="${_entry#*:}"
+        if [ "${_en}" = "${name}" ]; then
+            echo "${_ev}"
+            return 0
+        fi
+    done
+    echo "0"
+}
+
 ro2rw_convert_to_rw() {
     local extract_dir="$1"
     local do_dfe="$2"
+    local orig_sizes_str="$3"
     local converted=0
 
     log "Converting read-only partitions to read-write..."
@@ -529,8 +584,20 @@ ro2rw_convert_to_rw() {
                 # Get actual uncompressed data size (EROFS is highly compressed)
                 local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
-                # Add 50% + 200MB padding for EXT4 journal, inodes, and filesystem overhead
-                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" -v orig="${size}" 'BEGIN { s = (kb * 1024) * 1.50 + 209715200; if (s < orig) s = orig; printf "%.0f\n", s }')
+                # Use original partition size from lpdump when available, else compute
+                local _part_name="${name%.*}"
+                local _orig_size
+                _orig_size=$(ro2rw_get_orig_size "${_part_name}" "${orig_sizes_str}")
+                local new_size
+                if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
+                    # Use exact original partition size from lpdump so images fit in super
+                    new_size="${_orig_size}"
+                else
+                    # No lpdump size: use actual uncompressed data + 20% headroom
+                    new_size=$(${BB} awk -v kb="${uncompressed_kb}" -v orig="${size}" 'BEGIN { s = (kb * 1024) * 1.20 + 4194304; if (s < orig) s = orig; printf "%.0f\n", s }')
+                fi
+                # Enforce 64MB minimum so ext4 journal always fits
+                new_size=$(${BB} awk -v s="${new_size}" 'BEGIN { m=67108864; printf "%.0f\n", (s<m?m:s) }')
                 
                 # Create a raw ext4 image (not sparse) to mount and modify it
                 local raw_img="${extract_dir}/${name%.*}.raw.ext4"
@@ -591,12 +658,9 @@ ro2rw_convert_to_rw() {
                     rm -rf "${rw_mnt}"
                 fi
 
-                local new_img="${extract_dir}/${name%.*}.ext4.img"
                 if [ -f "${raw_img}" ]; then
-                    img2simg "${raw_img}" "${new_img}" 2>&1 | log || ${BB} mv -f "${raw_img}" "${new_img}"
-                    rm -f "${raw_img}"
-                    # Replace original
-                    ${BB} mv -f "${new_img}" "${img}"
+                    # Keep raw (non-sparse) — lpmake needs fstat-able files
+                    ${BB} mv -f "${raw_img}" "${img}"
                     converted=1
                     log "  Converted ${name} to EXT4"
                 else
@@ -628,8 +692,16 @@ ro2rw_convert_to_rw() {
                 # Get actual uncompressed size
                 local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
-                # Add 10% + 50MB padding
-                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.10 + 52428800 }')
+                # Use original partition size when available, else compute
+                local _part_name="${name%.*}"
+                local _orig_size
+                _orig_size=$(ro2rw_get_orig_size "${_part_name}" "${orig_sizes_str}")
+                local new_size
+                if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
+                    new_size="${_orig_size}"
+                else
+                    new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.10 + 52428800 }')
+                fi
                 
                 if [ ${mounted} -eq 1 ]; then
                     local raw_img="${extract_dir}/${name%.*}.raw.ext4"
@@ -649,11 +721,8 @@ ro2rw_convert_to_rw() {
                         rm -rf "${rw_mnt}"
                     fi
 
-                    local new_img="${extract_dir}/${name%.*}.ext4.img"
-                    img2simg "${raw_img}" "${new_img}" 2>&1 | log || ${BB} mv -f "${raw_img}" "${new_img}"
-                    rm -f "${raw_img}"
-
-                    ${BB} mv -f "${new_img}" "${img}"
+                    # Keep raw (non-sparse) — lpmake needs fstat-able files
+                    ${BB} mv -f "${raw_img}" "${img}"
                     converted=1
                     log "  Converted ${name} from F2FS to EXT4"
                 else
@@ -690,8 +759,15 @@ ro2rw_convert_to_rw() {
                 if [ ${needs_tuning} -eq 1 ]; then
                     local size
                     size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                    # Add 10% + 50MB padding to ensure make_ext4fs has room
-                    local new_size=$(${BB} awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
+                    local _part_name="${name%.*}"
+                    local _orig_size
+                    _orig_size=$(ro2rw_get_orig_size "${_part_name}" "${orig_sizes_str}")
+                    local new_size
+                    if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
+                        new_size="${_orig_size}"
+                    else
+                        new_size=$(${BB} awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
+                    fi
                     
                     local loop_dev=""
                     local mounted=0
@@ -726,11 +802,8 @@ ro2rw_convert_to_rw() {
                             rm -rf "${rw_mnt}"
                         fi
 
-                        local new_img="${extract_dir}/${name%.*}.rw.img"
-                        img2simg "${raw_img}" "${new_img}" 2>&1 | log || ${BB} mv -f "${raw_img}" "${new_img}"
-                        rm -f "${raw_img}"
-
-                        ${BB} mv -f "${new_img}" "${img}"
+                        # Keep raw (non-sparse) — lpmake needs fstat-able files
+                        ${BB} mv -f "${raw_img}" "${img}"
                         converted=1
                     else
                         log "  Cannot mount EXT4 natively for tuning, skipping"
@@ -756,12 +829,42 @@ ro2rw_convert_to_rw() {
     fi
 }
 
+ro2rw_get_orig_sizes() {
+    local metadata_file="$1"
+    # Parse lpdump output — compatible with busybox awk (no gawk extensions).
+    # lpdump format has lines like:
+    #   Partition name: odm_a        or   Name: odm_a
+    #   ...
+    #   Size: 8499200 bytes          or   Size: 8499200
+    awk '
+        /[Pp]artition[[:space:]]/ && !/[Gg]roup/ {
+            # Extract last whitespace-delimited token as partition name
+            name = $NF
+            # Strip trailing colon if present
+            sub(/:$/, "", name)
+        }
+        /^[[:space:]]*[Ss]ize:[[:space:]]/ && name != "" {
+            for (i = 1; i <= NF; i++) {
+                val = $i + 0
+                if (val > 0) {
+                    print name ":" val
+                    break
+                }
+            }
+            name = ""
+        }
+    ' "${metadata_file}" 2>/dev/null
+}
+
 ro2rw_build_new_super() {
     local extract_dir="$1"
     local metadata_file="$2"
+    local orig_sizes_str="$3"
     local new_super="${OUTPUTDIR}/super_rw.img"
+    # Use already-parsed metadata file (passed in) — avoids re-running lpdump
+    # against the SD card image which causes fstat failures on FAT32/exFAT.
     local metadata_info
-    metadata_info=$(lpdump "${OUTPUTDIR}/super_original.img" 2>&1 | grep -E "(super partition name:|block device-size:|partition size:|Partition name|Group name|Metadata max size|Metadata slot count|Block size)")
+    metadata_info=$(grep -E "(super partition name:|block device-size:|partition size:|Partition name|Group name|Metadata max size|Metadata slot count|Block size)" "${metadata_file}" 2>/dev/null || true)
 
     log "Building new read-write super image..."
 
@@ -798,33 +901,26 @@ ro2rw_build_new_super() {
     groups=$(${BB} grep -E "Group name|group:" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' | sort -u || true)
     [ -z "${groups}" ] && groups="default"
 
-    # Determine partition arrangement from lpdump
+    # Determine partition arrangement — use actual image file size so lpmake
+    # declared sizes always match the images being passed (no over-allocation).
+    # Build --partition args first, then --image args (lpmake requires this order).
     local partitions=""
     local image_args=""
     for img in "${extract_dir}"/*.img; do
+        [ -f "${img}" ] || continue
         local name
         name=$(${BB} basename "${img}" .img)
+        # Always use actual file size so declared size == image size
         local size
         size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-        # lpmake expands sparse images internally, so we must use the raw
-        # (uncompressed) size for --partition, not the sparse file size.
-        local _rawsz="${WORKDIR}/_rawsize_${name}.img"
-        simg2img "${img}" "${_rawsz}" 2>/dev/null && size=$(${BB} stat -c%s "${_rawsz}" 2>/dev/null) || true
-        rm -f "${_rawsz}"
+        [ -z "${size}" ] || [ "${size}" -eq 0 ] 2>/dev/null && continue
 
-        # Strip suffix if A/B
-        local base_name="${name}"
-        local group_name="default"
-
-        # Determine group from original metadata
-        local orig_group
+        local orig_group="default"
         orig_group=$(${BB} grep -B1 "${name}" "${metadata_file}" 2>/dev/null | ${BB} grep "Group name" 2>/dev/null | ${BB} awk '{print $NF}' || true)
-        if [ -z "${orig_group}" ]; then
-            orig_group="${group_name}"
-        fi
+        [ -z "${orig_group}" ] && orig_group="default"
 
-        partitions="${partitions} --partition ${base_name}:none:${size}:${orig_group}"
-        image_args="${image_args} --image ${base_name}=${img}"
+        partitions="${partitions} --partition ${name}:none:${size}:${orig_group}"
+        image_args="${image_args} --image ${name}=${img}"
     done
 
     # Build group arguments
@@ -855,38 +951,31 @@ ro2rw_build_new_super() {
 
     # Execute lpmake
     ${cmd} --output "${new_super}" 2>&1 | log || {
-        log "lpmake failed, trying alternative approach..."
-
-        # Fallback: try with default group and minimal metadata
-        local fallback_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}"
-        local fallback_image_args=""
-        for img in "${extract_dir}"/*.img; do
+        log "lpmake failed (likely SD card fstat issue), retrying with internal storage..."
+        # Copy images to internal /data which supports fstat properly
+        local local_img_dir="/data/local/tmp/superrw/lpmake_images"
+        rm -rf "${local_img_dir}"
+        mkdir -p "${local_img_dir}"
+        for _src in "${extract_dir}"/*.img; do
+            [ -f "${_src}" ] || continue
+            ${BB} cp "${_src}" "${local_img_dir}/" 2>/dev/null ||                 dd if="${_src}" of="${local_img_dir}/$(${BB} basename "${_src}")" bs=1M 2>/dev/null || true
+        done
+        # Build --partition and --image args in two passes (lpmake requires this order)
+        local local_part_args=""
+        local local_img_args=""
+        for img in "${local_img_dir}"/*.img; do
+            [ -f "${img}" ] || continue
             local name
             name=$(${BB} basename "${img}" .img)
             local size
             size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-            fallback_cmd="${fallback_cmd} --partition ${name}:none:${size}:default"
-            fallback_image_args="${fallback_image_args} --image ${name}=${img}"
+            [ -z "${size}" ] || [ "${size}" -eq 0 ] 2>/dev/null && continue
+            local_part_args="${local_part_args} --partition ${name}:none:${size}:default"
+            local_img_args="${local_img_args} --image ${name}=${img}"
         done
-        fallback_cmd="${fallback_cmd}${fallback_image_args}"
-        log "Fallback: ${fallback_cmd}"
-        ${fallback_cmd} --output "${new_super}" 2>&1 | log || {
-            log "lpmake failed on SD card paths, retrying with internal storage..."
-            local local_img_dir="/data/local/tmp/superrw/lpmake_images"
-            rm -rf "${local_img_dir}"
-            mkdir -p "${local_img_dir}"
-            cp "${extract_dir}"/*.img "${local_img_dir}/" < /dev/null 2>&1 | log || true
-            local local_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}"
-            for img in "${local_img_dir}"/*.img; do
-                local name
-                name=$(${BB} basename "${img}" .img)
-                local size
-                size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                local_cmd="${local_cmd} --partition ${name}:none:${size}:default --image ${name}=${img}"
-            done
-            log "Local lpmake: ${local_cmd}"
-            ${local_cmd} --output "${new_super}" 2>&1 | log || die "lpmake failed even with local images"
-        }
+        local local_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}${local_part_args}${local_img_args}"
+        log "Local lpmake: ${local_cmd}"
+        ${local_cmd} --output "${new_super}" 2>&1 | log || die "lpmake failed even with local images"
     }
 
     log "New RW super image created: ${new_super}"
@@ -949,12 +1038,16 @@ ro2rw_convert() {
     local metadata
     metadata=$(ro2rw_get_lp_metadata "${super_img}")
 
+    # Parse original partition sizes from lpdump metadata
+    local orig_sizes
+    orig_sizes=$(ro2rw_get_orig_sizes "${metadata}")
+
     # Extract partitions
     local extract_dir
     extract_dir=$(ro2rw_extract_partitions "${super_img}")
 
     # Convert to RW (and optionally DFE)
-    ro2rw_convert_to_rw "${extract_dir}" "${do_dfe}"
+    ro2rw_convert_to_rw "${extract_dir}" "${do_dfe}" "${orig_sizes}"
 
     # If DFE was requested, patch boot images too
     if [ "${do_dfe}" = "1" ]; then
@@ -964,7 +1057,7 @@ ro2rw_convert() {
 
     # Build new super
     local new_super
-    new_super=$(ro2rw_build_new_super "${extract_dir}" "${metadata}")
+    new_super=$(ro2rw_build_new_super "${extract_dir}" "${metadata}" "${orig_sizes}")
 
     log "RO2RW conversion complete!"
     log "New super image: ${new_super}"
