@@ -231,6 +231,7 @@ setup_binaries() {
     if [ -d "${BIN_DIR}" ]; then
         log "Setting execute permissions on bundled binaries..."
         chmod +x "${BIN_DIR}"/* 2>/dev/null || true
+        chmod -R a+rX "${BIN_DIR}" 2>/dev/null || true
         
         # Create wrappers to prevent LD_LIBRARY_PATH pollution
         local wrapper_dir="${BIN_DIR}/wrapper"
@@ -529,16 +530,48 @@ ro2rw_convert_to_rw() {
                 local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
                 # Add 50% + 200MB padding for EXT4 journal, inodes, and filesystem overhead
-                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.50 + 209715200 }')
+                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" -v orig="${size}" 'BEGIN { s = (kb * 1024) * 1.50 + 209715200; if (s < orig) s = orig; printf "%.0f\n", s }')
                 
                 # Create a raw ext4 image (not sparse) to mount and modify it
                 local raw_img="${extract_dir}/${name%.*}.raw.ext4"
-                if ! make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" 2>&1 | log; then
-                    log "  Failed to create ext4 image for ${name} (insufficient space or other error)"
+                make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" >"${WORKDIR}/_mkfs_${name%.*}.log" 2>&1 && _mkok=0 || _mkok=$?
+                cat "${WORKDIR}/_mkfs_${name%.*}.log" | log || true
+                if [ ${_mkok} -ne 0 ]; then
+                    log "  make_ext4fs failed, trying alternate method for ${name}..."
+                    rm -f "${raw_img}"
+                    # Create empty ext4, then mount and copy files from EROFS
+                    make_ext4fs -l "${new_size}" "${raw_img}" >"${WORKDIR}/_mkfs_${name%.*}.log" 2>&1 && _mkok=0 || _mkok=$?
+                    cat "${WORKDIR}/_mkfs_${name%.*}.log" | log || true
+                    if [ ${_mkok} -eq 0 ] && [ -f "${raw_img}" ]; then
+                        local ext4_mnt="${WORKDIR}/ext4_${name}"
+                        mkdir -p "${ext4_mnt}"
+                        local loop_dev2=$(losetup -f 2>/dev/null || true)
+                        if [ -n "${loop_dev2}" ]; then
+                            losetup "${loop_dev2}" "${raw_img}" 2>/dev/null || true
+                            if mount -t ext4 -o rw "${loop_dev2}" "${ext4_mnt}" 2>/dev/null || mount -o rw "${loop_dev2}" "${ext4_mnt}" 2>/dev/null; then
+                                log "  Copying files from EROFS into ext4 image..."
+                                ${BB} cp -a "${mnt_point}/." "${ext4_mnt}/" 2>&1 | log || true
+                                sync
+                                umount -fl "${ext4_mnt}" 2>/dev/null || true
+                                _mkok=0
+                            else
+                                _mkok=1
+                            fi
+                            losetup -d "${loop_dev2}" 2>/dev/null || true
+                        else
+                            _mkok=1
+                        fi
+                        rm -rf "${ext4_mnt}"
+                    fi
+                    # Clean up EROFS mount
                     umount -fl "${mnt_point}" 2>/dev/null || true
                     [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
-                    rm -rf "${mnt_point}"
-                    continue
+                    if [ ${_mkok} -ne 0 ]; then
+                        log "  Failed to create ext4 image for ${name} (all methods exhausted)"
+                        rm -rf "${mnt_point}"
+                        continue
+                    fi
+                    log "  Created ext4 image via alternate method: ${name}"
                 fi
                 umount -fl "${mnt_point}" 2>/dev/null || true
                 [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
@@ -773,6 +806,11 @@ ro2rw_build_new_super() {
         name=$(${BB} basename "${img}" .img)
         local size
         size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+        # lpmake expands sparse images internally, so we must use the raw
+        # (uncompressed) size for --partition, not the sparse file size.
+        local _rawsz="${WORKDIR}/_rawsize_${name}.img"
+        simg2img "${img}" "${_rawsz}" 2>/dev/null && size=$(${BB} stat -c%s "${_rawsz}" 2>/dev/null) || true
+        rm -f "${_rawsz}"
 
         # Strip suffix if A/B
         local base_name="${name}"
@@ -808,12 +846,19 @@ ro2rw_build_new_super() {
     log "lpmake command: ${cmd}"
     echo "${cmd}" > "${WORKDIR}/lpmake_cmd.txt"
 
+    # Verify all image files exist before running lpmake
+    for _vimg in "${extract_dir}"/*.img; do
+        if [ ! -f "${_vimg}" ]; then
+            die "Image file not found for lpmake: ${_vimg}"
+        fi
+    done
+
     # Execute lpmake
     ${cmd} --output "${new_super}" 2>&1 | log || {
         log "lpmake failed, trying alternative approach..."
 
         # Fallback: try with default group and minimal metadata
-        local fallback_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name} --group default:${total_size}"
+        local fallback_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}"
         local fallback_image_args=""
         for img in "${extract_dir}"/*.img; do
             local name
@@ -825,7 +870,23 @@ ro2rw_build_new_super() {
         done
         fallback_cmd="${fallback_cmd}${fallback_image_args}"
         log "Fallback: ${fallback_cmd}"
-        ${fallback_cmd} --output "${new_super}" 2>&1 | log || die "lpmake failed even with fallback"
+        ${fallback_cmd} --output "${new_super}" 2>&1 | log || {
+            log "lpmake failed on SD card paths, retrying with internal storage..."
+            local local_img_dir="/data/local/tmp/superrw/lpmake_images"
+            rm -rf "${local_img_dir}"
+            mkdir -p "${local_img_dir}"
+            cp "${extract_dir}"/*.img "${local_img_dir}/" < /dev/null 2>&1 | log || true
+            local local_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}"
+            for img in "${local_img_dir}"/*.img; do
+                local name
+                name=$(${BB} basename "${img}" .img)
+                local size
+                size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+                local_cmd="${local_cmd} --partition ${name}:none:${size}:default --image ${name}=${img}"
+            done
+            log "Local lpmake: ${local_cmd}"
+            ${local_cmd} --output "${new_super}" 2>&1 | log || die "lpmake failed even with local images"
+        }
     }
 
     log "New RW super image created: ${new_super}"
