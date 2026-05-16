@@ -528,8 +528,8 @@ ro2rw_convert_to_rw() {
                 # Get actual uncompressed data size (EROFS is highly compressed)
                 local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
-                # Add 25% + 100MB padding for EXT4 journal, inodes, decompression, and DFE changes
-                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.25 + 104857600 }')
+                # Add 50% + 200MB padding for EXT4 journal, inodes, and filesystem overhead
+                local new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.50 + 209715200 }')
                 
                 # Create a raw ext4 image (not sparse) to mount and modify it
                 local raw_img="${extract_dir}/${name%.*}.raw.ext4"
@@ -767,6 +767,7 @@ ro2rw_build_new_super() {
 
     # Determine partition arrangement from lpdump
     local partitions=""
+    local image_args=""
     for img in "${extract_dir}"/*.img; do
         local name
         name=$(${BB} basename "${img}" .img)
@@ -784,7 +785,8 @@ ro2rw_build_new_super() {
             orig_group="${group_name}"
         fi
 
-        partitions="${partitions} --partition ${base_name}:readonly:${size}:${orig_group}"
+        partitions="${partitions} --partition ${base_name}:none:${size}:${orig_group}"
+        image_args="${image_args} --image ${base_name}=${img}"
     done
 
     # Build group arguments
@@ -802,7 +804,7 @@ ro2rw_build_new_super() {
         group_args="${group_args} --group ${grp}:${max_size}"
     done
 
-    local cmd="lpmake ${lp_args} ${group_args} ${partitions}"
+    local cmd="lpmake ${lp_args} ${group_args} ${partitions}${image_args}"
     log "lpmake command: ${cmd}"
     echo "${cmd}" > "${WORKDIR}/lpmake_cmd.txt"
 
@@ -812,13 +814,16 @@ ro2rw_build_new_super() {
 
         # Fallback: try with default group and minimal metadata
         local fallback_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name} --group default:${total_size}"
+        local fallback_image_args=""
         for img in "${extract_dir}"/*.img; do
             local name
             name=$(${BB} basename "${img}" .img)
             local size
             size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-            fallback_cmd="${fallback_cmd} --partition ${name}:readonly:${size}:default"
+            fallback_cmd="${fallback_cmd} --partition ${name}:none:${size}:default"
+            fallback_image_args="${fallback_image_args} --image ${name}=${img}"
         done
+        fallback_cmd="${fallback_cmd}${fallback_image_args}"
         log "Fallback: ${fallback_cmd}"
         ${fallback_cmd} --output "${new_super}" 2>&1 | log || die "lpmake failed even with fallback"
     }
