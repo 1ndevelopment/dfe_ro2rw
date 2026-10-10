@@ -67,6 +67,10 @@ export OUTPUTDIR="${TMPDIR}/output"
 # Always defaults to internal /data; setup_workspace may override to WORKDIR
 # only after confirming the chosen filesystem is not nodev.
 export EXTRACT_DIR="/data/local/tmp/superrw/extracted"
+# MOUNT_ROOT: parent for loop-mount targets (mnt_*, rw_*). Like EXTRACT_DIR it
+# must live on a dev-capable filesystem; setup_workspace points it at internal
+# /data when the workspace is nodev (SD card / /sdcard).
+export MOUNT_ROOT="/data/local/tmp/superrw/mnt"
 
 # Prioritize bundled binaries over system ones
 export PATH="${BIN_DIR}:${PATH}"
@@ -151,16 +155,17 @@ setup_workspace() {
     # Otherwise co-locate with the workspace to avoid filling /data.
     if is_nodev_fs "${TMPDIR}"; then
         EXTRACT_DIR="/data/local/tmp/superrw/extracted"
-        mkdir -p "${EXTRACT_DIR}"
+        MOUNT_ROOT="/data/local/tmp/superrw/mnt"
+        mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
         # Initialize log file before logging (LOGFILE is on the chosen workspace)
         > "${LOGFILE}"
         log "Workspace initialized at ${TMPDIR}"
-        log "NOTE: ${TMPDIR} is mounted nodev — partition images will be extracted to"
-        log "      ${EXTRACT_DIR} (internal /data) to allow loop mounts if needed."
-        log "      Extracted tree directories (mnt_*) will use ${WORKDIR} on SD card."
+        log "NOTE: ${TMPDIR} is mounted nodev — partition images and loop-mount"
+        log "      targets will be placed under /data/local/tmp/superrw (internal /data)."
     else
         EXTRACT_DIR="${WORKDIR}/extracted"
-        mkdir -p "${EXTRACT_DIR}"
+        MOUNT_ROOT="${WORKDIR}/mnt"
+        mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
         > "${LOGFILE}"
         log "Workspace initialized at ${TMPDIR}"
         log "Extraction directory: ${EXTRACT_DIR}"
@@ -338,7 +343,9 @@ dfe_patch_fstab() {
     done
     rm -f "${_tmp_fstab}"
 
-    return ${patched}
+    # Exit 0 only when something was actually patched, so callers can use
+    # `if dfe_patch_fstab ...` to decide whether to repack/patch further.
+    [ "${patched}" -eq 1 ]
 }
 
 dfe_patch_init_rc() {
@@ -357,7 +364,8 @@ dfe_patch_init_rc() {
         patched=1
     fi
 
-    return ${patched}
+    # Exit 0 only when something was actually patched (see dfe_patch_fstab).
+    [ "${patched}" -eq 1 ]
 }
 
 dfe_patch_fstabs_in_dir() {
@@ -394,7 +402,6 @@ dfe_patch_rc_in_dir() {
 
 dfe_patch_boot_images() {
     log "Patching fstab in boot image ramdisks..."
-    local found=0
     for boot_part in boot vendor_boot init_boot; do
         local boot_dev
         boot_dev=$(find_block "${boot_part}${CURRENT_SUFFIX}" 2>/dev/null) || continue
@@ -406,19 +413,28 @@ dfe_patch_boot_images() {
             mkdir -p ramdisk_root
             cd ramdisk_root
             magiskboot cpio "../ramdisk.cpio" extract 2>/dev/null || true
+            local part_patched=0
             for fstab in $(find . -name "fstab.*" -type f 2>/dev/null); do
                 if dfe_patch_fstab "${fstab}"; then
                     magiskboot cpio "../ramdisk.cpio" "add 644 ${fstab} ${fstab}" 2>/dev/null
-                    found=1
+                    part_patched=1
                 fi
             done
             cd "${boot_dir}"
-            magiskboot repack "${boot_dev}" 2>/dev/null
-            local new_boot="${boot_dir}/new-boot.img"
-            if [ -f "${new_boot}" ]; then
-                blockdev --setrw "${boot_dev}" 2>/dev/null || true
-                cat "${new_boot}" > "${boot_dev}"
-                log "Patched ${boot_part} ramdisk fstab"
+            # Only touch the boot partition if something was actually patched.
+            if [ ${part_patched} -eq 1 ]; then
+                magiskboot repack "${boot_dev}" 2>/dev/null
+                local new_boot="${boot_dir}/new-boot.img"
+                if [ -f "${new_boot}" ]; then
+                    # Keep a stock copy so the user can restore if AVB rejects it.
+                    dd if="${boot_dev}" of="${BACKUPDIR}/${boot_part}${CURRENT_SUFFIX}.img" 2>/dev/null || true
+                    log "WARNING: writing modified ${boot_part} — if DM-Verity/AVB is enabled"
+                    log "         the device may not boot. To disable verification run:"
+                    log "         fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img"
+                    blockdev --setrw "${boot_dev}" 2>/dev/null || true
+                    cat "${new_boot}" > "${boot_dev}"
+                    log "Patched ${boot_part} ramdisk fstab (stock image backed up)"
+                fi
             fi
         fi
         cd "${TMPDIR}"
@@ -475,9 +491,8 @@ ro2rw_dump_super() {
 
     log "Dumping super partition to ${super_img}..."
     if [ -b "${SUPER_BLOCK}" ]; then
-        dd if="${SUPER_BLOCK}" of="${super_img}" bs=1M conv=sparse 2>/dev/null || {
-            dd if="${SUPER_BLOCK}" of="${super_img}" bs=1M 2>/dev/null || die "Failed to dump super partition"
-        }
+        # toybox dd (Android) rejects conv=sparse, so just use plain dd.
+        dd if="${SUPER_BLOCK}" of="${super_img}" bs=1M 2>/dev/null || die "Failed to dump super partition"
     else
         die "Super block device not found"
     fi
@@ -593,7 +608,7 @@ ro2rw_convert_to_rw() {
             "erofs")
                 log "  Converting EROFS -> EXT4: ${name}"
                 local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                local mnt_point="${WORKDIR}/mnt_${name}"
+                local mnt_point="${MOUNT_ROOT}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
                 # Mount or extract the erofs image
@@ -614,14 +629,19 @@ ro2rw_convert_to_rw() {
                 
                 if [ ${mounted} -eq 0 ]; then
                     log "  Cannot mount EROFS natively, falling back to manual extraction..."
-                    # Extract the erofs image
-                    erofs -i "${img}" -x "${mnt_point}" 2>/dev/null || \
-                    erofs extract -i "${img}" -x "${mnt_point}" 2>/dev/null || \
-                    erofs "${img}" "${mnt_point}" 2>/dev/null || {
-                        log "  Skipping conversion for ${name} (cannot mount or extract EROFS)"
+                    # Bundled erofs CLI: -i/--image, -x (extract all), -o/--outdir, -f.
+                    erofs -i "${img}" -x -o "${mnt_point}" -f 2>/dev/null \
+                        || erofs --image="${img}" --extract --outdir="${mnt_point}" -f 2>/dev/null \
+                        || true
+                    # erofs can exit 0 without extracting anything (e.g. wrong image
+                    # format). Never pack an empty tree — that would replace the
+                    # partition with a blank filesystem.
+                    if [ -z "$(ls -A "${mnt_point}" 2>/dev/null)" ]; then
+                        log "  Skipping conversion for ${name} (EROFS extract produced no data)"
                         [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
+                        rm -rf "${mnt_point}"
                         continue
-                    }
+                    fi
                 fi
 
                 # Get actual uncompressed data size (EROFS is highly compressed)
@@ -655,18 +675,37 @@ ro2rw_convert_to_rw() {
                     dfe_patch_fstabs_in_dir "${mnt_point}"
                     dfe_patch_rc_in_dir "${mnt_point}"
                     _dfe_done_pre=1
-                elif [ "${do_dfe}" = "1" ] && [ ${mounted} -eq 1 ]; then
-                    log "  Applying DFE to ${name} (pre-pack)..."
-                    # mnt_point is a kernel-mounted read-only EROFS.
-                    # Patch fstabs via temp copies on /data and repack with make_ext4fs.
-                    # We'll handle this by patching inside the ext4 mount in the alternate path.
-                    _dfe_done_pre=0
                 fi
+                # When mounted RO (kernel EROFS), the source tree can't be patched.
+                # DFE is applied to the produced ext4 image (raw_img) below instead.
 
                 # Create a raw ext4 image (not sparse) — lpmake needs fstat-able files
                 local raw_img="${extract_dir}/${name%.*}.raw.ext4"
                 make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" >"${WORKDIR}/_mkfs_${name%.*}.log" 2>&1 && _mkok=0 || _mkok=$?
                 cat "${WORKDIR}/_mkfs_${name%.*}.log" | log || true
+
+                # DFE for kernel-mounted (RO) EROFS: patch the built ext4 image
+                # in place, since the source mount is read-only.
+                if [ "${do_dfe}" = "1" ] && [ "${_dfe_done_pre}" = "0" ] && [ "${_mkok}" -eq 0 ] && [ -f "${raw_img}" ]; then
+                    local _dfe_mnt="/data/local/tmp/superrw_dfe_${name%.*}"
+                    local _dfe_loop=""
+                    rm -rf "${_dfe_mnt}"; mkdir -p "${_dfe_mnt}"
+                    _dfe_loop=$(losetup -f 2>/dev/null || true)
+                    if [ -n "${_dfe_loop}" ]; then
+                        losetup "${_dfe_loop}" "${raw_img}" 2>/dev/null || true
+                        if mount -t ext4 -o rw "${_dfe_loop}" "${_dfe_mnt}" 2>/dev/null || mount -o rw "${_dfe_loop}" "${_dfe_mnt}" 2>/dev/null; then
+                            log "  Applying DFE to ${name} (inside ext4 image)..."
+                            dfe_patch_fstabs_in_dir "${_dfe_mnt}"
+                            dfe_patch_rc_in_dir "${_dfe_mnt}"
+                            sync
+                            umount -fl "${_dfe_mnt}" 2>/dev/null || true
+                        else
+                            log "  WARNING: could not mount ${name} ext4 image to apply DFE"
+                        fi
+                        losetup -d "${_dfe_loop}" 2>/dev/null || true
+                    fi
+                    rm -rf "${_dfe_mnt}"
+                fi
                 if [ ${_mkok} -ne 0 ]; then
                     log "  make_ext4fs failed, trying alternate method for ${name}..."
                     rm -f "${raw_img}"
@@ -779,7 +818,7 @@ ro2rw_convert_to_rw() {
             "f2fs")
                 log "  Handling F2FS: ${name}"
                 local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
-                local mnt_point="${WORKDIR}/mnt_${name}"
+                local mnt_point="${MOUNT_ROOT}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
                 # Try mounting natively
@@ -837,7 +876,7 @@ ro2rw_convert_to_rw() {
                 ;;
             "ext4")
                 log "  Already EXT4, verifying RW compatibility: ${name}"
-                local mnt_point="${WORKDIR}/mnt_${name}"
+                local mnt_point="${MOUNT_ROOT}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 local needs_tuning=0
                 
@@ -895,7 +934,7 @@ ro2rw_convert_to_rw() {
                         [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
                         
                         if [ "${do_dfe}" = "1" ]; then
-                            local rw_mnt="${WORKDIR}/rw_${name}"
+                            local rw_mnt="${MOUNT_ROOT}/rw_${name}"
                             mkdir -p "${rw_mnt}"
                             if mount -t ext4 -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null || mount -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null; then
                                 log "  Applying DFE to ${name}..."
@@ -983,6 +1022,25 @@ ro2rw_get_orig_sizes() {
     ' "${metadata_file}" 2>/dev/null
 }
 
+ro2rw_get_groups() {
+    # Print "<group>:<max_bytes>" for each group in lpdump's Group table.
+    awk '
+        /^Group table:/ { g = 1; next }
+        g && /^[[:space:]]*Name:[[:space:]]/ { name = $NF; sub(/:$/, "", name); next }
+        g && /^[[:space:]]*Maximum size:/ { print name ":" ($(NF-1)+0) }
+    ' "$1" 2>/dev/null
+}
+
+ro2rw_get_part_group() {
+    # Print the group name of partition $1 (empty if not found).
+    awk -v want="$1" '
+        /^Partition table:/ { p = 1; next }
+        /^Super partition layout:/ { p = 0 }
+        p && /^[[:space:]]*Name:[[:space:]]/ { cur = $NF; sub(/:$/, "", cur); next }
+        p && /^[[:space:]]*Group:[[:space:]]/ && cur == want { print $NF; exit }
+    ' "$2" 2>/dev/null
+}
+
 ro2rw_build_new_super() {
     local extract_dir="$1"
     local metadata_file="$2"
@@ -990,8 +1048,6 @@ ro2rw_build_new_super() {
     local new_super="${OUTPUTDIR}/super_rw.img"
     # Use already-parsed metadata file (passed in) — avoids re-running lpdump
     # against the SD card image which causes fstat failures on FAT32/exFAT.
-    local metadata_info
-    metadata_info=$(grep -E "(super partition name:|block device-size:|partition size:|Partition name|Group name|Metadata max size|Metadata slot count|Block size)" "${metadata_file}" 2>/dev/null || true)
 
     log "Building new read-write super image..."
 
@@ -1004,9 +1060,10 @@ ro2rw_build_new_super() {
 
     # Parse lpdump for metadata
     if [ -f "${metadata_file}" ]; then
-        block_size=$(${BB} grep -m1 "Block size" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
-        [ -z "${block_size}" ] && block_size="4096"
-        super_name=$(${BB} grep -m1 "super partition name:" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
+        # lpdump does not print the super block size; logical partitions always
+        # use 4096-byte sectors, so just default to it.
+        block_size=4096
+        super_name=$(${BB} grep -m1 "Partition name:" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
         [ -z "${super_name}" ] && super_name="super"
         metadata_slots=$(${BB} grep -m1 "Metadata slot count" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
         [ -z "${metadata_slots}" ] && metadata_slots="3"
@@ -1023,9 +1080,9 @@ ro2rw_build_new_super() {
 
     lp_args="--device-size ${total_size} --metadata-size ${metadata_max_size} --metadata-slots ${metadata_slots} --block-size ${block_size} --super-name ${super_name}"
 
-    # Detect groups from lpdump
+    # Detect groups from lpdump (Group table entries are "name:max_bytes").
     local groups
-    groups=$(${BB} grep -E "Group name|group:" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' | sort -u || true)
+    groups=$(ro2rw_get_groups "${metadata_file}")
     [ -z "${groups}" ] && groups="default"
 
     # Determine partition arrangement — use actual image file size so lpmake
@@ -1049,25 +1106,25 @@ ro2rw_build_new_super() {
     _budget=$(${BB} awk -v ts="${total_size}" -v mr="${_meta_reserve}"         'BEGIN{printf "%d", ts - mr}')
     if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
         log "WARNING: Partition images total ${_total_parts} bytes, but super budget is ${_budget} bytes."
-        log "         Shrinking oversized ext4 images proportionally to fit..."
+        log "         Shrinking ext4 images to their minimum size..."
         for img in "${extract_dir}"/*.img; do
             [ -f "${img}" ] || continue
-            _iname=$(${BB} basename "${img}" .img)
-            _isz=$(${BB} stat -c%s "${img}" 2>/dev/null || echo 0)
-            # Compute allowed size: proportional share of budget, aligned to 4096
-            _allowed=$(${BB} awk -v sz="${_isz}" -v tot="${_total_parts}" -v bgt="${_budget}"                 'BEGIN{printf "%d", int(sz/tot*bgt/4096)*4096}')
-            if [ "${_allowed}" -lt "${_isz}" ] 2>/dev/null && [ "${_allowed}" -gt 0 ] 2>/dev/null; then
-                log "  Shrinking ${_iname}: ${_isz} -> ${_allowed} bytes"
-                # e2fsck then resize2fs to shrink safely; fall back to truncate
-                e2fsck -fy "${img}" >/dev/null 2>&1 || true
-                if resize2fs "${img}" "$((${_allowed}/4096))s" >/dev/null 2>&1; then
-                    truncate -s "${_allowed}" "${img}" 2>/dev/null || true
-                else
-                    log "  resize2fs failed for ${_iname}, using truncate (may corrupt fs)"
-                    truncate -s "${_allowed}" "${img}" 2>/dev/null || true
-                fi
-            fi
+            _iname=$(${BB} basename "${img}")
+            e2fsck -fy "${img}" >/dev/null 2>&1 || true
+            # resize2fs -M shrinks the filesystem AND the file to its minimum.
+            resize2fs -M "${img}" >/dev/null 2>&1 || log "  WARNING: could not shrink ${_iname} to minimum"
         done
+        # Re-measure. If still too big, refuse — a blind truncate would corrupt.
+        _total_parts=0
+        for img in "${extract_dir}"/*.img; do
+            [ -f "${img}" ] || continue
+            _sz=$(${BB} stat -c%s "${img}" 2>/dev/null || echo 0)
+            _total_parts=$(${BB} awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
+        done
+        if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
+            die "Decompressed images (${_total_parts} bytes) still exceed the super budget (${_budget} bytes) after shrinking. The super partition is too small to hold the ext4 filesystems; a device-specific smaller image layout is required."
+        fi
+        log "  Images shrunk to fit: ${_total_parts} <= ${_budget} bytes"
     fi
 
     local partitions=""
@@ -1081,8 +1138,8 @@ ro2rw_build_new_super() {
         size=$(${BB} stat -c%s "${img}" 2>/dev/null)
         [ -z "${size}" ] || [ "${size}" -eq 0 ] 2>/dev/null && continue
 
-        local orig_group="default"
-        orig_group=$(${BB} grep -B1 "${name}" "${metadata_file}" 2>/dev/null | ${BB} grep "Group name" 2>/dev/null | ${BB} awk '{print $NF}' || true)
+        local orig_group
+        orig_group=$(ro2rw_get_part_group "${name}" "${metadata_file}")
         [ -z "${orig_group}" ] && orig_group="default"
 
         partitions="${partitions} --partition ${name}:none:${size}:${orig_group}"
@@ -1091,13 +1148,13 @@ ro2rw_build_new_super() {
 
     # Build group arguments
     local group_args=""
-    for grp in ${groups}; do
+    for grp_entry in ${groups}; do
+        local grp="${grp_entry%%:*}"
+        local max_size="${grp_entry#*:}"
+        # lpmake auto-creates the default group; only emit named groups.
         if [ "${grp}" = "default" ]; then
             continue
         fi
-        local max_size=0
-        # Get max size from original metadata
-        max_size=$(${BB} grep -A2 "Group name.*${grp}" "${metadata_file}" 2>/dev/null | ${BB} grep "max size" 2>/dev/null | ${BB} awk '{print $(NF-1)}' || true)
         if [ -z "${max_size}" ] || [ "${max_size}" = "0" ] || [ "${max_size}" = "none" ]; then
             max_size="${total_size}"
         fi
@@ -1139,7 +1196,7 @@ ro2rw_build_new_super() {
             local_part_args="${local_part_args} --partition ${name}:none:${size}:default"
             local_img_args="${local_img_args} --image ${name}=${img}"
         done
-        local local_cmd="lpmake --device-size ${total_size} --metadata-size 65536 --metadata-slots 3 --block-size 4096 --super-name ${super_name}${local_part_args}${local_img_args} --output ${new_super}"
+        local local_cmd="lpmake --device-size ${total_size} --metadata-size ${metadata_max_size} --metadata-slots ${metadata_slots} --block-size ${block_size} --super-name ${super_name}${local_part_args}${local_img_args} --output ${new_super}"
         log "Local lpmake: ${local_cmd}"
         ${local_cmd} 2>&1 | log || die "lpmake failed even with local images"
     }
@@ -1164,6 +1221,22 @@ ro2rw_flash_super() {
         log "  fastboot flash super ${super_img}"
         log "  fastboot reboot"
     fi
+
+    # Refuse to flash an image larger than the target — dd would corrupt the
+    # super partition and could brick the device.
+    local _img_size _tgt_size
+    _img_size=$(${BB} stat -c%s "${super_img}" 2>/dev/null || echo 0)
+    _tgt_size=$(blockdev --getsize64 "${SUPER_BLOCK}" 2>/dev/null || echo 0)
+    if [ "${_tgt_size}" -gt 0 ] 2>/dev/null && [ "${_img_size}" -gt "${_tgt_size}" ] 2>/dev/null; then
+        die "Refusing to flash: image is ${_img_size} bytes but super is only ${_tgt_size} bytes."
+    fi
+
+    echo -n "This will OVERWRITE ${SUPER_BLOCK} with ${super_img} — continue? [y/N]: "
+    read -r _flash_ans
+    case "${_flash_ans}" in
+        [Yy]*) ;;
+        *) log "Flash cancelled by user."; return 1 ;;
+    esac
 
     # Direct dd flash (works if bootloader is unlocked and partition is writable)
     log "Attempting direct flash..."
@@ -1193,7 +1266,9 @@ ro2rw_convert() {
 
     # Dump super
     local super_img
-    super_img=$(ro2rw_dump_super)
+    if ! super_img=$(ro2rw_dump_super); then
+        die "Failed to dump super partition"
+    fi
 
     # Backup original (skippable — useful when re-running after a failed attempt
     # and the original dump already exists on the SD card)
@@ -1217,15 +1292,21 @@ ro2rw_convert() {
 
     # Get metadata
     local metadata
-    metadata=$(ro2rw_get_lp_metadata "${super_img}")
+    if ! metadata=$(ro2rw_get_lp_metadata "${super_img}"); then
+        die "Failed to read logical partition metadata (lpdump)"
+    fi
 
     # Parse original partition sizes from lpdump metadata
     local orig_sizes
-    orig_sizes=$(ro2rw_get_orig_sizes "${metadata}")
+    if ! orig_sizes=$(ro2rw_get_orig_sizes "${metadata}") || [ -z "${orig_sizes}" ]; then
+        die "Failed to parse partition sizes from lpdump output"
+    fi
 
     # Extract partitions
     local extract_dir
-    extract_dir=$(ro2rw_extract_partitions "${super_img}")
+    if ! extract_dir=$(ro2rw_extract_partitions "${super_img}"); then
+        die "Failed to extract partitions from super image"
+    fi
 
     # Convert to RW (and optionally DFE)
     ro2rw_convert_to_rw "${extract_dir}" "${do_dfe}" "${orig_sizes}"
@@ -1238,7 +1319,9 @@ ro2rw_convert() {
 
     # Build new super
     local new_super
-    new_super=$(ro2rw_build_new_super "${extract_dir}" "${metadata}" "${orig_sizes}")
+    if ! new_super=$(ro2rw_build_new_super "${extract_dir}" "${metadata}" "${orig_sizes}"); then
+        die "Failed to build new super image"
+    fi
 
     log "RO2RW conversion complete!"
     log "New super image: ${new_super}"
@@ -1339,7 +1422,6 @@ main() {
                 read -r _img_choice
                 _idx=0
                 _chosen=""
-                IFS=' '
                 for _img in ${_img_list}; do
                     _idx=$((_idx + 1))
                     if [ "${_idx}" -eq "${_img_choice}" ] 2>/dev/null; then
