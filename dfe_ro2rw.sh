@@ -123,16 +123,16 @@ export MOUNT_ROOT="${MOUNT_ROOT:-${TMPDIR}/mnt}"
 
 case "${ARCH}" in
     aarch64|arm64|arm64-v8a)
-        export ARCH_DIR="arm64"
+        export ARCH_DIR="bin/arm64"
         ;;
     armv7l|armv8l|arm32|armeabi*|arm)
-        export ARCH_DIR="arm32"
+        export ARCH_DIR="bin/arm32"
         ;;
     x86_64|amd64)
-        export ARCH_DIR="x86_64"
+        export ARCH_DIR="bin/x86_64"
         ;;
     i*86|x86)
-        export ARCH_DIR="x86"
+        export ARCH_DIR="bin/x86"
         ;;
     *)
         die "Unsupported architecture: ${ARCH}"
@@ -140,6 +140,56 @@ case "${ARCH}" in
 esac
 
 export BIN_DIR="${SCRIPT_DIR}/${ARCH_DIR}"
+
+# Bundled binaries ship compressed (bin/<arch>/*.tar.gz) and are extracted
+# at runtime to keep the repo small. cleanup_bundled_binaries always runs
+# on exit and removes only the extracted files (never the .tar.gz).
+extract_bundled_binaries() {
+    local _archive=""
+    for _a in "${BIN_DIR}"/*.tar.gz; do
+        [ -f "${_a}" ] || continue
+        _archive="${_a}"
+        break
+    done
+    [ -n "${_archive}" ] || return 0
+    if ! command -v tar >/dev/null 2>&1; then
+        die "tar not found — cannot extract ${_archive}"
+    fi
+    log "Extracting bundled binaries: ${_archive}..."
+    tar -xzf "${_archive}" -C "${BIN_DIR}" || die "Failed to extract ${_archive}"
+}
+
+cleanup_bundled_binaries() {
+    [ -n "${BIN_DIR:-}" ] || return 0
+    [ -d "${BIN_DIR:-}" ] || return 0
+    rm -rf "${BIN_DIR}/wrapper" 2>/dev/null || true
+    local _archive=""
+    for _a in "${BIN_DIR}"/*.tar.gz; do
+        [ -f "${_a}" ] || continue
+        _archive="${_a}"
+        break
+    done
+    if [ -n "${_archive}" ] && command -v tar >/dev/null 2>&1; then
+        tar -tzf "${_archive}" 2>/dev/null | while IFS= read -r _e; do
+            [ -n "${_e}" ] || continue
+            rm -rf "${BIN_DIR}/${_e}" 2>/dev/null || true
+        done
+    else
+        local _f
+        for _f in "${BIN_DIR}"/*; do
+            [ -e "${_f}" ] || continue
+            case "${_f}" in
+                *.tar.gz) continue ;;
+                *) rm -rf "${_f}" 2>/dev/null || true ;;
+            esac
+        done
+    fi
+    return 0
+}
+trap 'cleanup_bundled_binaries' EXIT
+trap 'cleanup_bundled_binaries; exit 130' INT
+trap 'cleanup_bundled_binaries; exit 143' TERM
+extract_bundled_binaries
 
 # Prioritize bundled binaries over system ones
 if [ -d "${BIN_DIR}" ]; then
@@ -426,13 +476,21 @@ setup_binaries() {
     log "Binary directory: ${BIN_DIR}"
     if [ -d "${BIN_DIR}" ]; then
         log "Setting execute permissions on bundled binaries..."
-        chmod +x "${BIN_DIR}"/* 2>/dev/null || true
+        for _b in "${BIN_DIR}"/*; do
+            case "${_b}" in
+                *.tar.gz) continue ;;
+                *) chmod +x "${_b}" 2>/dev/null || true ;;
+            esac
+        done
         chmod -R a+rX "${BIN_DIR}" 2>/dev/null || true
         
         # Create wrappers to prevent LD_LIBRARY_PATH pollution
         local wrapper_dir="${BIN_DIR}/wrapper"
         mkdir -p "${wrapper_dir}"
         for bin in "${BIN_DIR}"/*; do
+            case "${bin}" in
+                *.tar.gz) continue ;;
+            esac
             if [ -f "${bin}" ] && [ -x "${bin}" ]; then
                 local bname
                 bname=$(basename "${bin}")
@@ -444,7 +502,7 @@ setup_binaries() {
         done
         export PATH="${wrapper_dir}:${PATH}"
         
-        ls -1 "${BIN_DIR}" 2>/dev/null | log || true
+        ls -1 "${BIN_DIR}" 2>/dev/null | grep -v '\.tar\.gz$' | log || true
     else
         log "WARNING: Binary directory ${BIN_DIR} not found!"
     fi
@@ -773,6 +831,30 @@ ro2rw_get_orig_size() {
     echo "0"
 }
 
+# Fallback fstype detection when blkid is unavailable (host has no blkid,
+# bundled busybox has no blkid applet). Prints ext4/erofs/f2fs or nothing.
+ro2rw_detect_fstype() {
+    local img="$1"
+    local fb magic
+
+    if command -v file >/dev/null 2>&1; then
+        fb=$(file -b "${img}" 2>/dev/null || true)
+        case "${fb}" in
+            *[Ee][Rr][Oo][Ff][Ss]*|*erofs*) echo "erofs"; return 0 ;;
+            *[Ff]2[Ff][Ss]*|*F2FS*) echo "f2fs"; return 0 ;;
+            *ext2*|*ext3*|*ext4*) echo "ext4"; return 0 ;;  # file prints ext4 as "ext2 ... (extents)"
+        esac
+    fi
+
+    # No file(1): check the ext superblock magic 0x53EF at offset 0x438.
+    # shortcut: 2 bytes only, no fsck — enough to tell ext apart from EROFS.
+    if command -v od >/dev/null 2>&1; then
+        magic=$(dd if="${img}" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' || true)
+        [ "${magic}" = "53ef" ] && { echo "ext4"; return 0; }
+    fi
+    return 0
+}
+
 ro2rw_convert_to_rw() {
     local extract_dir="$1"
     local do_dfe="$2"
@@ -788,6 +870,16 @@ ro2rw_convert_to_rw() {
         fstype=$(${BB:+$BB }blkid "${img}" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' || true)
         if [ -z "${fstype}" ]; then
             fstype=$(blkid "${img}" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' || true)
+        fi
+        if [ -z "${fstype}" ]; then
+            fstype=$(ro2rw_detect_fstype "${img}" || true)
+        fi
+
+        # 0-byte images come from lpunpack when a slot has no extents — nothing
+        # to convert; skip before any mount/fsck attempt.
+        if [ ! -s "${img}" ]; then
+            log "  Empty image, skipping: ${name}"
+            continue
         fi
 
         log "Processing: ${name} (fs: ${fstype})"
@@ -943,7 +1035,7 @@ ro2rw_convert_to_rw() {
                                 _src_kb=$(${BB:+$BB }du -sk "${mnt_point}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')
                                 _dst_kb=$(${BB:+$BB }du -sk "${ext4_mnt}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')
                                 if [ -n "${_src_kb}" ] && [ -n "${_dst_kb}" ] && [ "${_src_kb}" -gt 0 ]; then
-                                    _pct=$(${BB:+$BB }awk -v s="${_src_kb}" -v d="${_dst_kb}" 'BEGIN { printf "%d", d*100/s }')
+                                    _pct=$(${BB:+$BB }awk -v s="${_src_kb}" -v d="${_dst_kb}" 'BEGIN { printf "%.0f", d*100/s }')
                                     if [ "${_pct}" -lt 80 ]; then
                                         log "  WARNING: Only ${_pct}% of source data copied — image too small; retrying with larger size"
                                         _cp_err=1
@@ -1151,7 +1243,7 @@ ro2rw_convert_to_rw() {
                 rm -rf "${mnt_point}"
                 ;;
             *)
-                if ${BB:+$BB }strings "${img}" 2>/dev/null | head -5 | grep -q "ext4" 2>/dev/null; then
+                if ${BB:+$BB }strings "${img}" 2>/dev/null | grep -qi "ext4" 2>/dev/null; then
                     log "  Detected as EXT4 by signature: ${name}"
                 else
                     log "  Unknown fstype, skipping: ${name}"
@@ -1292,18 +1384,19 @@ ro2rw_build_new_super() {
     for img in "${extract_dir}"/*.img; do
         [ -f "${img}" ] || continue
         _sz=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null || echo 0)
-        _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
+        _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%.0f", a+b}')
     done
     # Reserve space for metadata: slots * max_size * 2 (primary+backup) + 1MB headroom
     local _meta_reserve
-    _meta_reserve=$(${BB:+$BB }awk -v slots="${metadata_slots}" -v ms="${metadata_max_size}"         'BEGIN{printf "%d", slots*ms*2 + 1048576}')
+    _meta_reserve=$(${BB:+$BB }awk -v slots="${metadata_slots}" -v ms="${metadata_max_size}"         'BEGIN{printf "%.0f", slots*ms*2 + 1048576}')
     local _budget
-    _budget=$(${BB:+$BB }awk -v ts="${total_size}" -v mr="${_meta_reserve}"         'BEGIN{printf "%d", ts - mr}')
+    _budget=$(${BB:+$BB }awk -v ts="${total_size}" -v mr="${_meta_reserve}"         'BEGIN{printf "%.0f", ts - mr}')
     if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
         log "WARNING: Partition images total ${_total_parts} bytes, but super budget is ${_budget} bytes."
         log "         Shrinking ext4 images to their minimum size..."
         for img in "${extract_dir}"/*.img; do
             [ -f "${img}" ] || continue
+            [ -s "${img}" ] || continue  # 0-byte slot image — nothing to shrink
             _iname=$(${BB:+$BB }basename "${img}")
             e2fsck -fy "${img}" >/dev/null 2>&1 || true
             # resize2fs -M shrinks the filesystem AND the file to its minimum.
@@ -1314,7 +1407,7 @@ ro2rw_build_new_super() {
         for img in "${extract_dir}"/*.img; do
             [ -f "${img}" ] || continue
             _sz=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null || echo 0)
-            _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
+            _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%.0f", a+b}')
         done
         if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
             die "Decompressed images (${_total_parts} bytes) still exceed the super budget (${_budget} bytes) after shrinking. The super partition is too small to hold the ext4 filesystems; a device-specific smaller image layout is required."
