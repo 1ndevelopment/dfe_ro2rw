@@ -34,7 +34,7 @@ This tool aims to simplify the process of making system partitions modifiable an
 
 1. **Root Access**: Magisk or KernelSU must be installed.
 2. **Android 10+**: Device must utilize dynamic partitions (`super` partition block).
-3. **Architecture**: Supports `arm64` and `arm32` devices (ensure the respective `arm64`/`arm32` directories containing the binaries are placed next to the script).
+3. **Architecture**: Supports `arm64` and `arm32` devices (ensure the respective `arm64`/`arm32` directories containing the binaries are placed next to the script). Also runs on Termux and regular `x86_64` Linux shells (uses host system tools where bundled binaries are absent; Android-only steps such as live DFE and direct flashing are skipped with a message there — use image-file mode, see below).
 4. **Storage Space**: You will need sufficient free storage to dump and rebuild the `super` partition. Usually, at least **10GB to 15GB** of free space is recommended, depending on your device's `super` partition size.
 
 ---
@@ -73,6 +73,30 @@ This tool aims to simplify the process of making system partitions modifiable an
    ============================================
    ```
    Select your desired option. 
+
+### Running on Termux / regular Linux (image-file mode)
+
+On non-Android shells there are no `/dev/block` devices, so point the script
+at a dumped super image instead of a block device:
+
+```bash
+sh dfe_ro2rw.sh /path/to/super.img
+# equivalent: SUPERRW_SUPER_IMG=/path/to/super.img sh dfe_ro2rw.sh
+```
+
+Useful environment overrides (all optional):
+
+| Variable | Effect |
+|---|---|
+| `SUPERRW_TMPDIR` | Workspace root (default: `/data/local/tmp/superrw` on Android, `$PREFIX/tmp/superrw` on Termux, `/tmp/superrw` on Linux) |
+| `SUPERRW_SUPER_IMG` | Super image file to work on (same as passing it as first argument) |
+| `SUPERRW_SUPER_BLOCK` | Explicit super block device (Android) |
+| `SUPERRW_NONINTERACTIVE` | Skip the interactive workspace prompt, use defaults |
+
+Notes: root is only required on Android (Linux warns and continues);
+Android-only steps (live DFE, boot-image patching, direct `dd` flashing)
+are skipped off-device — flash the produced image with
+`fastboot flash super super_rw.img` instead.
 
 ### Menu Options Explained
 

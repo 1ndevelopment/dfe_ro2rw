@@ -1,4 +1,4 @@
-#!/system/bin/sh
+#!/usr/bin/env sh
 
 ###############################################################################
 # DFE + RO2RW Universal Script
@@ -21,10 +21,105 @@ set -e
 (set -o pipefail 2>/dev/null) && set -o pipefail || true
 
 ###############################################################################
+# Platform Detection
+###############################################################################
+# IS_ANDROID: root shell on Android (also true in Termux, where /system is
+#             readable). Gates Android-only paths and tools.
+# IS_TERMUX:  $PREFIX points at a Termux install.
+# Anything else is a regular Linux shell (desktop/server): block devices,
+# magiskboot, getprop and resetprop are simply absent there.
+IS_ANDROID=0
+IS_TERMUX=0
+if [ "$(uname -o 2>/dev/null || true)" = "Android" ] || [ -e /system/build.prop ]; then
+    IS_ANDROID=1
+fi
+case "${PREFIX:-}" in
+    *termux*) IS_TERMUX=1 ;;
+esac
+
+# Base workspace directory — every temp path derives from this.
+# Override everything at once with SUPERRW_TMPDIR.
+_sys_tmpdir="${TMPDIR:-/tmp}"
+if [ "${IS_TERMUX}" = "1" ] && [ -n "${PREFIX}" ] && [ -d "${PREFIX}" ]; then
+    BASE_TMP="${SUPERRW_TMPDIR:-${PREFIX}/tmp/superrw}"
+    INTERNAL_TMP="${BASE_TMP}"
+elif [ "${IS_ANDROID}" = "1" ]; then
+    BASE_TMP="${SUPERRW_TMPDIR:-/data/local/tmp/superrw}"
+    # Internal /data scratch: dev-capable, used for intermediates when the
+    # chosen workspace sits on a nodev filesystem (SD card / /sdcard).
+    INTERNAL_TMP="/data/local/tmp/superrw"
+elif [ "${IS_TERMUX}" = "1" ]; then
+    # Termux with an unusable $PREFIX — fall back to $HOME.
+    BASE_TMP="${SUPERRW_TMPDIR:-${HOME:-${_sys_tmpdir}}/superrw}"
+    INTERNAL_TMP="${BASE_TMP}"
+else
+    BASE_TMP="${SUPERRW_TMPDIR:-${_sys_tmpdir}/superrw}"
+    INTERNAL_TMP="${BASE_TMP}"
+fi
+unset _sys_tmpdir
+mkdir -p "${BASE_TMP}" 2>/dev/null || true
+
+###############################################################################
 # Environment & Paths
 ###############################################################################
-export SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-export ARCH=$(uname -m)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export SCRIPT_DIR
+ARCH="$(uname -m)"
+export ARCH
+
+###############################################################################
+# Logging & Utilities
+###############################################################################
+log() {
+    local msg
+    if [ $# -gt 0 ]; then
+        msg="[$(date '+%H:%M:%S')] $*"
+        echo "${msg}" >> "${LOGFILE}" 2>/dev/null || true
+        echo "${msg}" >&2
+    else
+        while IFS= read -r line; do
+            msg="[$(date '+%H:%M:%S')] ${line}"
+            echo "${msg}" >> "${LOGFILE}" 2>/dev/null || true
+            echo "${msg}" >&2
+        done
+    fi
+}
+
+die() {
+    log "FATAL: $*"
+    exit 1
+}
+
+# TMPDIR doubles as the workspace root, so it always follows BASE_TMP
+# (use SUPERRW_TMPDIR to move it). The rest honour pre-set values.
+export TMPDIR="${BASE_TMP}"
+export LOGFILE="${LOGFILE:-${TMPDIR}/dfe_ro2rw.log}"
+mkdir -p "$(dirname "${LOGFILE}")" 2>/dev/null || true
+export BACKUPDIR="${BACKUPDIR:-${TMPDIR}/backup}"
+export WORKDIR="${WORKDIR:-${TMPDIR}/work}"
+export OUTPUTDIR="${OUTPUTDIR:-${TMPDIR}/output}"
+export SUPER_BLOCK=""
+export CURRENT_SLOT=""
+export CURRENT_SUFFIX=""
+export UNCURRENT_SUFFIX=""
+# Image-file mode: work on a dumped super image instead of a /dev/block/*
+# device. Accepts SUPERRW_SUPER_IMG, SUPERRW_SUPER_BLOCK, or the first
+# script argument (only used off-Android; Android always probes by-name).
+if [ $# -gt 0 ] && [ -f "$1" ]; then
+    SUPER_IMG="${SUPER_IMG:-$1}"
+fi
+export SUPER_IMG="${SUPER_IMG:-${SUPERRW_SUPER_IMG:-}}"
+export SUPER_BLOCK="${SUPER_BLOCK:-${SUPERRW_SUPER_BLOCK:-}}"
+
+# EXTRACT_DIR: where lpunpack output and raw.ext4 intermediates live.
+# Must be on a dev-capable filesystem (not nodev) so loop mounts work if needed.
+# Always defaults to internal /data; setup_workspace may override to WORKDIR
+# only after confirming the chosen filesystem is not nodev.
+export EXTRACT_DIR="${EXTRACT_DIR:-${TMPDIR}/extracted}"
+# MOUNT_ROOT: parent for loop-mount targets (mnt_*, rw_*). Like EXTRACT_DIR it
+# must live on a dev-capable filesystem; setup_workspace points it at internal
+# /data when the workspace is nodev (SD card / /sdcard).
+export MOUNT_ROOT="${MOUNT_ROOT:-${TMPDIR}/mnt}"
 
 case "${ARCH}" in
     aarch64|arm64|arm64-v8a)
@@ -46,38 +141,20 @@ esac
 
 export BIN_DIR="${SCRIPT_DIR}/${ARCH_DIR}"
 
-export TMPDIR="/data/local/tmp/superrw"
-export LOGFILE="${TMPDIR}/dfe_ro2rw.log"
-export BACKUPDIR="${TMPDIR}/backup"
-export WORKDIR="${TMPDIR}/work"
-export OUTPUTDIR="${TMPDIR}/output"
-export SUPER_BLOCK=""
-export CURRENT_SLOT=""
-export CURRENT_SUFFIX=""
-export UNCURRENT_SUFFIX=""
-
-# Default paths (can be overridden)
-export TMPDIR="/data/local/tmp/superrw"
-export LOGFILE="${TMPDIR}/dfe_ro2rw.log"
-export BACKUPDIR="${TMPDIR}/backup"
-export WORKDIR="${TMPDIR}/work"
-export OUTPUTDIR="${TMPDIR}/output"
-# EXTRACT_DIR: where lpunpack output and raw.ext4 intermediates live.
-# Must be on a dev-capable filesystem (not nodev) so loop mounts work if needed.
-# Always defaults to internal /data; setup_workspace may override to WORKDIR
-# only after confirming the chosen filesystem is not nodev.
-export EXTRACT_DIR="/data/local/tmp/superrw/extracted"
-# MOUNT_ROOT: parent for loop-mount targets (mnt_*, rw_*). Like EXTRACT_DIR it
-# must live on a dev-capable filesystem; setup_workspace points it at internal
-# /data when the workspace is nodev (SD card / /sdcard).
-export MOUNT_ROOT="/data/local/tmp/superrw/mnt"
-
 # Prioritize bundled binaries over system ones
-export PATH="${BIN_DIR}:${PATH}"
+if [ -d "${BIN_DIR}" ]; then
+    export PATH="${BIN_DIR}:${PATH}"
+fi
 
-BB="" # busybox path
+BB="" # busybox path (empty on Linux/Termux without busybox)
 
 find_external_sdcard() {
+    # Android-only: physical SD cards live under /storage/XXXX-XXXX or
+    # /mnt/media_rw/XXXX-XXXX. Never probed on plain Linux (no such mounts).
+    if [ "${IS_ANDROID}" != "1" ]; then
+        echo ""
+        return 0
+    fi
     local sd=""
     # Look for standard Android physical SD card mount paths (e.g. /storage/XXXX-XXXX)
     sd=$(mount | awk '{print $3}' | grep -E "^/storage/[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$" | head -n 1 || true)
@@ -96,6 +173,24 @@ find_external_sdcard() {
     echo ""
 }
 
+_mount_options() {
+    # Print the mount options of the filesystem mounted at $1.
+    # /proc/mounts is authoritative on both Linux and Android
+    # (device mountpoint fstype options ...). The `mount` output is only a
+    # fallback and comes in two shapes:
+    #   util-linux/toybox: "dev on /mp type fst (ro,nodev,...)" -> $6
+    #   busybox legacy:    "dev /mp fst ro,nodev,..."            -> $4
+    local mp="$1" opts
+    opts=$(awk -v mp="${mp}" '$2 == mp { print $4; exit }' /proc/mounts 2>/dev/null || true)
+    if [ -z "${opts}" ]; then
+        opts=$(mount 2>/dev/null | awk -v mp="${mp}" '
+            $3 == mp { for (i = NF; i > 3; i--) if ($i ~ /^\(.*\)$/) { print substr($i, 2, length($i) - 2); exit } }
+            $2 == mp { print $4; exit }
+        ' || true)
+    fi
+    echo "${opts}"
+}
+
 is_nodev_fs() {
     # Returns 0 (true) if the filesystem containing the given path is mounted nodev.
     local path="$1"
@@ -104,19 +199,61 @@ is_nodev_fs() {
     while [ ! -d "${check}" ] && [ "${check}" != "/" ]; do
         check=$(dirname "${check}")
     done
-    # /proc/mounts is most reliable: fields are device mountpoint fstype options ...
-    if awk -v mp="${check}" '$2 == mp { print $4 }' /proc/mounts 2>/dev/null | grep -q "nodev"; then
-        return 0
-    fi
-    # Fallback: busybox mount output: "device on mountpoint type fstype (options)"
-    # Field 3 = mountpoint, field 6 = (options)
-    if mount 2>/dev/null | awk -v mp="${check}" '$3 == mp { print $6 }' | grep -q "nodev"; then
-        return 0
-    fi
-    return 1
+    _mount_options "${check}" | grep -q "nodev"
 }
 
 setup_workspace() {
+    # Android (native root shell): unchanged interactive menu.
+    if [ "${IS_ANDROID}" = "1" ] && [ "${IS_TERMUX}" != "1" ]; then
+        _setup_workspace_android
+        return $?
+    fi
+
+    # Linux / Termux: BASE_TMP by default, non-interactively.
+    local choose="${BASE_TMP}"
+    if [ -t 0 ] && [ -z "${SUPERRW_NONINTERACTIVE:-}" ]; then
+        echo ""
+        echo "============================================"
+        echo "  Workspace Storage Location"
+        echo "============================================"
+        printf '%s' "Workspace directory [${BASE_TMP}]: "
+        read -r _ws_dir
+        if [ -n "${_ws_dir}" ]; then
+            choose="${_ws_dir}"
+        fi
+    fi
+
+    TMPDIR="${choose}"
+    LOGFILE="${TMPDIR}/dfe_ro2rw.log"
+    BACKUPDIR="${TMPDIR}/backup"
+    WORKDIR="${TMPDIR}/work"
+    OUTPUTDIR="${TMPDIR}/output"
+
+    mkdir -p "${TMPDIR}" "${BACKUPDIR}" "${WORKDIR}" "${OUTPUTDIR}"
+
+    # Decide where to put lpunpack output and raw.ext4 intermediates.
+    # These files may need loop-mounting, which requires a dev-capable filesystem.
+    # If the chosen workspace is nodev, keep them on INTERNAL_TMP.
+    # Otherwise co-locate with the workspace.
+    if is_nodev_fs "${TMPDIR}"; then
+        EXTRACT_DIR="${INTERNAL_TMP}/extracted"
+        MOUNT_ROOT="${INTERNAL_TMP}/mnt"
+        mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
+        : > "${LOGFILE}" 2>/dev/null || true
+        log "Workspace initialized at ${TMPDIR}"
+        log "NOTE: ${TMPDIR} is mounted nodev — partition images and loop-mount"
+        log "      targets will be placed under ${INTERNAL_TMP}."
+    else
+        EXTRACT_DIR="${WORKDIR}/extracted"
+        MOUNT_ROOT="${WORKDIR}/mnt"
+        mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
+        : > "${LOGFILE}" 2>/dev/null || true
+        log "Workspace initialized at ${TMPDIR}"
+        log "Extraction directory: ${EXTRACT_DIR}"
+    fi
+}
+
+_setup_workspace_android() {
     local ext_sd
     ext_sd=$(find_external_sdcard)
 
@@ -124,14 +261,14 @@ setup_workspace() {
     echo "============================================"
     echo "  Workspace Storage Location"
     echo "============================================"
-    echo "  1) Internal Data (/data/local/tmp/superrw) [Recommended, Fast]"
+    echo "  1) Internal Data (${BASE_TMP}) [Recommended, Fast]"
     echo "  2) Internal Storage (/sdcard/superrw)"
     
     if [ -n "${ext_sd}" ]; then
         echo "  3) External MicroSD Card (${ext_sd}/superrw)"
     fi
     
-    echo -n "Select option: "
+    printf '%s' "Select option: "
     read -r ws_choice
 
     if [ "${ws_choice}" = "3" ] && [ -n "${ext_sd}" ]; then
@@ -139,7 +276,7 @@ setup_workspace() {
     elif [ "${ws_choice}" = "2" ]; then
         TMPDIR="/sdcard/superrw"
     else
-        TMPDIR="/data/local/tmp/superrw"
+        TMPDIR="${BASE_TMP}"
     fi
 
     LOGFILE="${TMPDIR}/dfe_ro2rw.log"
@@ -154,45 +291,45 @@ setup_workspace() {
     # If the chosen workspace is nodev (SD card, /sdcard), keep them on internal /data.
     # Otherwise co-locate with the workspace to avoid filling /data.
     if is_nodev_fs "${TMPDIR}"; then
-        EXTRACT_DIR="/data/local/tmp/superrw/extracted"
-        MOUNT_ROOT="/data/local/tmp/superrw/mnt"
+        EXTRACT_DIR="${INTERNAL_TMP}/extracted"
+        MOUNT_ROOT="${INTERNAL_TMP}/mnt"
         mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
         # Initialize log file before logging (LOGFILE is on the chosen workspace)
-        > "${LOGFILE}"
+        : > "${LOGFILE}" 2>/dev/null || true
         log "Workspace initialized at ${TMPDIR}"
         log "NOTE: ${TMPDIR} is mounted nodev — partition images and loop-mount"
-        log "      targets will be placed under /data/local/tmp/superrw (internal /data)."
+        log "      targets will be placed under ${INTERNAL_TMP} (internal /data)."
     else
         EXTRACT_DIR="${WORKDIR}/extracted"
         MOUNT_ROOT="${WORKDIR}/mnt"
         mkdir -p "${EXTRACT_DIR}" "${MOUNT_ROOT}"
-        > "${LOGFILE}"
+        : > "${LOGFILE}" 2>/dev/null || true
         log "Workspace initialized at ${TMPDIR}"
         log "Extraction directory: ${EXTRACT_DIR}"
     fi
 }
 
 ###############################################################################
-# Logging & Utilities
+# Tool Utilities
 ###############################################################################
-log() {
-    local msg
-    if [ $# -gt 0 ]; then
-        msg="[$(date '+%H:%M:%S')] $*"
-        echo "${msg}" >> "${LOGFILE}"
-        echo "${msg}" >&2
-    else
-        while IFS= read -r line; do
-            msg="[$(date '+%H:%M:%S')] ${line}"
-            echo "${msg}" >> "${LOGFILE}"
-            echo "${msg}" >&2
-        done
+readlink_f() {
+    # readlink -f is absent from some toybox/busybox builds — fall back to
+    # realpath, then to the path as given.
+    local out=""
+    out=$(readlink -f "$1" 2>/dev/null) || out=""
+    if [ -z "${out}" ] && command -v realpath >/dev/null 2>&1; then
+        out=$(realpath "$1" 2>/dev/null) || out=""
     fi
+    [ -n "${out}" ] || out="$1"
+    echo "${out}"
 }
 
-die() {
-    log "FATAL: $*"
-    exit 1
+_tmpf() {
+    # Scratch file under the workspace — replaces direct /data/local/tmp usage
+    # for sed temp files, DFE/loop mount points and lpmake staging.
+    local root="${WORKDIR:-${BASE_TMP}/work}"
+    mkdir -p "${root}" 2>/dev/null || true
+    echo "${root}/$1"
 }
 
 find_busybox() {
@@ -232,8 +369,10 @@ require_tool() {
 # Partition Detection
 ###############################################################################
 get_current_slot() {
-    local slot
-    slot=$(getprop ro.boot.slot_suffix 2>/dev/null)
+    local slot=""
+    if command -v getprop >/dev/null 2>&1; then
+        slot=$(getprop ro.boot.slot_suffix 2>/dev/null)
+    fi
     if [ -z "${slot}" ]; then
         slot=$(sed -n 's/.*androidboot.slot_suffix=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)
     fi
@@ -249,21 +388,31 @@ get_current_slot() {
 }
 
 find_super_block() {
+    # Environment/argument overrides win on every platform.
+    if [ -n "${SUPER_BLOCK}" ]; then
+        log "Using SUPERRW_SUPER_BLOCK: ${SUPER_BLOCK}"
+        return 0
+    fi
+    if [ -n "${SUPER_IMG}" ] && [ -f "${SUPER_IMG}" ]; then
+        SUPER_BLOCK="${SUPER_IMG}"
+        log "Using super image file: ${SUPER_BLOCK}"
+        return 0
+    fi
     for dev in /dev/block/by-name/super /dev/block/bootdevice/by-name/super /dev/block/platform/*/by-name/super; do
         if [ -b "${dev}" ]; then
-            SUPER_BLOCK=$(readlink -f "${dev}")
+            SUPER_BLOCK=$(readlink_f "${dev}")
             log "Super block device: ${SUPER_BLOCK}"
             return 0
         fi
     done
-    die "Could not find super partition block device"
+    die "Could not find super partition block device (set SUPERRW_SUPER_IMG=/path/to/super.img to work on an image file)"
 }
 
 find_block() {
     local name="$1"
     for dev in "/dev/block/by-name/${name}" "/dev/block/bootdevice/by-name/${name}"; do
         if [ -b "${dev}" ]; then
-            readlink -f "${dev}"
+            readlink_f "${dev}"
             return 0
         fi
     done
@@ -287,7 +436,7 @@ setup_binaries() {
             if [ -f "${bin}" ] && [ -x "${bin}" ]; then
                 local bname
                 bname=$(basename "${bin}")
-                echo "#!/system/bin/sh" > "${wrapper_dir}/${bname}"
+                echo "#!/usr/bin/env sh" > "${wrapper_dir}/${bname}"
                 echo "export LD_LIBRARY_PATH=\"${BIN_DIR}/lib:${BIN_DIR}:\${LD_LIBRARY_PATH}\"" >> "${wrapper_dir}/${bname}"
                 echo "exec \"${bin}\" \"\$@\"" >> "${wrapper_dir}/${bname}"
                 chmod +x "${wrapper_dir}/${bname}"
@@ -302,15 +451,26 @@ setup_binaries() {
 
     if find_busybox; then
         log "Using busybox: ${BB}"
-    else
+    elif [ "${IS_ANDROID}" = "1" ]; then
         die "Busybox not found. Make sure to push the ${ARCH_DIR} directory to $(dirname "${BIN_DIR}")."
+    else
+        # Off-Android the host has its own coreutils — busybox is optional.
+        BB=""
+        log "WARNING: busybox not found — using host coreutils (stat/basename/du/awk/grep/...)"
     fi
 
     require_tool "lpdump"
     require_tool "lpmake"
     require_tool "lpunpack"
     require_tool "make_ext4fs"
-    require_tool "magiskboot"
+    if [ "${IS_ANDROID}" = "1" ]; then
+        require_tool "magiskboot"
+    else
+        # Boot image patching is Android-only; dfe_patch_boot_images no-ops
+        # off-Android, so a missing magiskboot only earns a warning.
+        command -v magiskboot >/dev/null 2>&1 \
+            || log "WARNING: magiskboot not found (only needed for boot image patching on Android)"
+    fi
 
     log "All required tools found (prioritizing bundled in ${BIN_DIR})"
 }
@@ -329,8 +489,9 @@ dfe_patch_fstab() {
     log "Patching fstab: ${fstab_file}"
 
     # sed -i requires a writable temp file on the same filesystem, which fails on
-    # FAT32/exFAT (SD card). Use an explicit temp file on internal /data instead.
-    local _tmp_fstab="/data/local/tmp/_dfe_fstab_patch.tmp"
+    # FAT32/exFAT (SD card). Use an explicit temp file in the workspace instead.
+    local _tmp_fstab
+    _tmp_fstab=$(_tmpf "_dfe_fstab_patch.tmp")
 
     local patterns="fileencryption= forceencrypt= forcefdeorfbe= encryptable= metadata_encryption= keydirectory= inlinecrypt quota wrappedkey"
     for pattern in ${patterns}; do
@@ -358,7 +519,8 @@ dfe_patch_init_rc() {
 
     # Remove any DFE-NEO injection markers from previous runs
     if grep -q "DFE-NEO" "${rc_file}" 2>/dev/null; then
-        local _tmp_rc="/data/local/tmp/_dfe_rc_patch.tmp"
+        local _tmp_rc
+        _tmp_rc=$(_tmpf "_dfe_rc_patch.tmp")
         sed '/DFE-NEO/d' "${rc_file}" > "${_tmp_rc}" && cp "${_tmp_rc}" "${rc_file}"
         rm -f "${_tmp_rc}"
         patched=1
@@ -401,6 +563,14 @@ dfe_patch_rc_in_dir() {
 }
 
 dfe_patch_boot_images() {
+    if [ "${IS_ANDROID}" != "1" ]; then
+        log "SKIP: boot image ramdisk patching is Android-only (magiskboot + /dev/block writes)"
+        return 0
+    fi
+    if ! command -v magiskboot >/dev/null 2>&1; then
+        log "SKIP: magiskboot not available — cannot unpack/repack boot images"
+        return 0
+    fi
     log "Patching fstab in boot image ramdisks..."
     for boot_part in boot vendor_boot init_boot; do
         local boot_dev
@@ -431,7 +601,9 @@ dfe_patch_boot_images() {
                     log "WARNING: writing modified ${boot_part} — if DM-Verity/AVB is enabled"
                     log "         the device may not boot. To disable verification run:"
                     log "         fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img"
-                    blockdev --setrw "${boot_dev}" 2>/dev/null || true
+                    if command -v blockdev >/dev/null 2>&1; then
+                        blockdev --setrw "${boot_dev}" 2>/dev/null || true
+                    fi
                     cat "${new_boot}" > "${boot_dev}"
                     log "Patched ${boot_part} ramdisk fstab (stock image backed up)"
                 fi
@@ -445,12 +617,24 @@ dfe_patch_boot_images() {
 dfe_hide_encrypted_flag() {
     # Force system to think data is not encrypted
     log "Setting ro.crypto.state to 'unencrypted'..."
-    resetprop ro.crypto.state unencrypted 2>/dev/null || true
-    resetprop ro.crypto.type file 2>/dev/null || true
-    log "Encryption state properties set"
+    if command -v resetprop >/dev/null 2>&1; then
+        resetprop ro.crypto.state unencrypted 2>/dev/null || true
+        resetprop ro.crypto.type file 2>/dev/null || true
+        log "Encryption state properties set"
+    else
+        log "SKIP: resetprop not available (Android-only)"
+    fi
 }
 
 dfe_disable_encryption_live() {
+    if [ "${IS_ANDROID}" != "1" ]; then
+        log "============================================"
+        log "  Disable Force Encryption (DFE) - Live"
+        log "============================================"
+        log "SKIP: live DFE requires Android (live remounts, /dev/block boot writes, resetprop)."
+        log "      On Linux, use menu option 3 (DFE + RO2RW) to patch the partition images."
+        return 0
+    fi
     log "============================================"
     log "  Disable Force Encryption (DFE) - Live"
     log "============================================"
@@ -493,21 +677,25 @@ ro2rw_dump_super() {
     if [ -b "${SUPER_BLOCK}" ]; then
         # toybox dd (Android) rejects conv=sparse, so just use plain dd.
         dd if="${SUPER_BLOCK}" of="${super_img}" bs=1M 2>/dev/null || die "Failed to dump super partition"
+    elif [ -f "${SUPER_BLOCK}" ]; then
+        # Image file mode (Linux / already-dumped image): copy, don't dd.
+        cp "${SUPER_BLOCK}" "${super_img}" || die "Failed to copy super image"
     else
         die "Super block device not found"
     fi
 
     local size
-    size=$(${BB} stat -c%s "${super_img}" 2>/dev/null)
+    size=$(${BB:+$BB }stat -c%s "${super_img}" 2>/dev/null)
     log "Dumped super image: ${size} bytes"
     echo "${super_img}"
 }
 
 ro2rw_get_lp_metadata() {
     local super_img="$1"
-    # Write metadata to internal storage — SD card (FAT32/exFAT) file redirects
+    # Write metadata inside the workspace — SD card (FAT32/exFAT) file redirects
     # can fail silently, and lpdump output must be reliably writable.
-    local metadata_file="/data/local/tmp/superrw_lp_metadata.txt"
+    local metadata_file
+    metadata_file=$(_tmpf "superrw_lp_metadata.txt")
     mkdir -p "$(dirname "${metadata_file}")"
 
     log "Reading logical partition metadata..."
@@ -595,9 +783,9 @@ ro2rw_convert_to_rw() {
 
     for img in "${extract_dir}"/*.img; do
         local name
-        name=$(${BB} basename "${img}")
+        name=$(${BB:+$BB }basename "${img}")
         local fstype
-        fstype=$(${BB} blkid "${img}" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' || true)
+        fstype=$(${BB:+$BB }blkid "${img}" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' || true)
         if [ -z "${fstype}" ]; then
             fstype=$(blkid "${img}" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p' || true)
         fi
@@ -607,7 +795,8 @@ ro2rw_convert_to_rw() {
         case "${fstype}" in
             "erofs")
                 log "  Converting EROFS -> EXT4: ${name}"
-                local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+                local size
+                size="$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null)"
                 local mnt_point="${MOUNT_ROOT}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
@@ -645,7 +834,8 @@ ro2rw_convert_to_rw() {
                 fi
 
                 # Get actual uncompressed data size (EROFS is highly compressed)
-                local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
+                local uncompressed_kb
+                uncompressed_kb="$(${BB:+$BB }du -sk "${mnt_point}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')"
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
                 # Use original partition size from lpdump when available, else compute
                 local _part_name="${name%.*}"
@@ -659,10 +849,10 @@ ro2rw_convert_to_rw() {
                     # No lpdump size: use actual uncompressed data + 40% headroom.
                     # ext4 needs extra space for journal, inode table, and block group
                     # descriptors on top of raw file data — 20% was too tight.
-                    new_size=$(${BB} awk -v kb="${uncompressed_kb}" -v orig="${size}" 'BEGIN { s = (kb * 1024) * 1.40 + 8388608; if (s < orig) s = orig; printf "%.0f\n", s }')
+                    new_size=$(${BB:+$BB }awk -v kb="${uncompressed_kb}" -v orig="${size}" 'BEGIN { s = (kb * 1024) * 1.40 + 8388608; if (s < orig) s = orig; printf "%.0f\n", s }')
                 fi
                 # Enforce 64MB minimum so ext4 journal always fits
-                new_size=$(${BB} awk -v s="${new_size}" 'BEGIN { m=67108864; printf "%.0f\n", (s<m?m:s) }')
+                new_size=$(${BB:+$BB }awk -v s="${new_size}" 'BEGIN { m=67108864; printf "%.0f\n", (s<m?m:s) }')
 
                 # Apply DFE patches before packing into ext4.
                 # When the EROFS was extracted by a userspace tool (mounted=0), the
@@ -687,7 +877,8 @@ ro2rw_convert_to_rw() {
                 # DFE for kernel-mounted (RO) EROFS: patch the built ext4 image
                 # in place, since the source mount is read-only.
                 if [ "${do_dfe}" = "1" ] && [ "${_dfe_done_pre}" = "0" ] && [ "${_mkok}" -eq 0 ] && [ -f "${raw_img}" ]; then
-                    local _dfe_mnt="/data/local/tmp/superrw_dfe_${name%.*}"
+                    local _dfe_mnt
+                    _dfe_mnt=$(_tmpf "superrw_dfe_${name%.*}")
                     local _dfe_loop=""
                     rm -rf "${_dfe_mnt}"; mkdir -p "${_dfe_mnt}"
                     _dfe_loop=$(losetup -f 2>/dev/null || true)
@@ -713,7 +904,7 @@ ro2rw_convert_to_rw() {
                     # decompressed into ext4 (journal + inode table overhead).
                     # Add 20% headroom capped at the super device budget.
                     local alt_size
-                    alt_size=$(${BB} awk -v s="${new_size}" -v kb="${uncompressed_kb}" -v orig="${_orig_size}" 'BEGIN {
+                    alt_size=$(${BB:+$BB }awk -v s="${new_size}" -v kb="${uncompressed_kb}" -v orig="${_orig_size}" 'BEGIN {
                         data = kb * 1024
                         candidate = data * 1.30 + 8388608
                         candidate = (candidate > s ? candidate : s)
@@ -725,18 +916,20 @@ ro2rw_convert_to_rw() {
                     cat "${WORKDIR}/_mkfs_${name%.*}.log" | log || true
                     if [ ${_mkok} -eq 0 ] && [ -f "${raw_img}" ]; then
                         # ext4 loop mount requires a dev-capable filesystem.
-                        # Use internal /data regardless of workspace choice.
-                        local ext4_mnt="/data/local/tmp/superrw_ext4_${name}"
+                        # Use INTERNAL_TMP regardless of workspace choice.
+                        local ext4_mnt
+                        ext4_mnt=$(_tmpf "superrw_ext4_${name}")
                         rm -rf "${ext4_mnt}"
                         mkdir -p "${ext4_mnt}"
-                        local loop_dev2=$(losetup -f 2>/dev/null || true)
+                        local loop_dev2
+                        loop_dev2="$(losetup -f 2>/dev/null || true)"
                         if [ -n "${loop_dev2}" ]; then
                             losetup "${loop_dev2}" "${raw_img}" 2>/dev/null || true
                             if mount -t ext4 -o rw "${loop_dev2}" "${ext4_mnt}" 2>/dev/null || mount -o rw "${loop_dev2}" "${ext4_mnt}" 2>/dev/null; then
                                 log "  Copying files from EROFS into ext4 image..."
                                 # Capture cp exit status separately — piping through log swallows it
                                 _cp_err=0
-                                ${BB} cp -a "${mnt_point}/." "${ext4_mnt}/" 2>&1 | log || _cp_err=1
+                                ${BB:+$BB }cp -a "${mnt_point}/." "${ext4_mnt}/" 2>&1 | log || _cp_err=1
                                 sync
                                 # If DFE wasn't applied pre-pack (EROFS kernel-mounted RO),
                                 # apply fstab patches now inside the writable ext4 mount.
@@ -747,10 +940,10 @@ ro2rw_convert_to_rw() {
                                 fi
                                 # Verify the copy filled at least 80% of what the source had.
                                 # If the image ran out of space cp will have printed errors above.
-                                _src_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
-                                _dst_kb=$(${BB} du -sk "${ext4_mnt}" 2>/dev/null | ${BB} awk '{print $1}')
+                                _src_kb=$(${BB:+$BB }du -sk "${mnt_point}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')
+                                _dst_kb=$(${BB:+$BB }du -sk "${ext4_mnt}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')
                                 if [ -n "${_src_kb}" ] && [ -n "${_dst_kb}" ] && [ "${_src_kb}" -gt 0 ]; then
-                                    _pct=$(${BB} awk -v s="${_src_kb}" -v d="${_dst_kb}" 'BEGIN { printf "%d", d*100/s }')
+                                    _pct=$(${BB:+$BB }awk -v s="${_src_kb}" -v d="${_dst_kb}" 'BEGIN { printf "%d", d*100/s }')
                                     if [ "${_pct}" -lt 80 ]; then
                                         log "  WARNING: Only ${_pct}% of source data copied — image too small; retrying with larger size"
                                         _cp_err=1
@@ -764,7 +957,7 @@ ro2rw_convert_to_rw() {
                                     losetup -d "${loop_dev2}" 2>/dev/null || true
                                     rm -f "${raw_img}"
                                     local retry_size
-                                    retry_size=$(${BB} awk -v kb="${uncompressed_kb}" -v orig="${_orig_size}" 'BEGIN {
+                                    retry_size=$(${BB:+$BB }awk -v kb="${uncompressed_kb}" -v orig="${_orig_size}" 'BEGIN {
                                         candidate = (kb * 1024) * 1.50 + 16777216
                                         if (orig > 0 && candidate > orig) candidate = orig
                                         printf "%.0f\n", candidate
@@ -774,7 +967,7 @@ ro2rw_convert_to_rw() {
                                         loop_dev2=$(losetup -f 2>/dev/null || true)
                                         losetup "${loop_dev2}" "${raw_img}" 2>/dev/null || true
                                         mount -t ext4 -o rw "${loop_dev2}" "${ext4_mnt}" 2>/dev/null || true
-                                        ${BB} cp -a "${mnt_point}/." "${ext4_mnt}/" 2>&1 | log || true
+                                        ${BB:+$BB }cp -a "${mnt_point}/." "${ext4_mnt}/" 2>&1 | log || true
                                         sync
                                         if [ "${do_dfe}" = "1" ] && [ "${_dfe_done_pre}" = "0" ]; then
                                             dfe_patch_fstabs_in_dir "${ext4_mnt}"
@@ -808,7 +1001,7 @@ ro2rw_convert_to_rw() {
                 rm -rf "${mnt_point}"
 
                 if [ -f "${raw_img}" ]; then
-                    ${BB} mv -f "${raw_img}" "${img}"
+                    ${BB:+$BB }mv -f "${raw_img}" "${img}"
                     converted=1
                     log "  Converted ${name} to EXT4"
                 else
@@ -817,7 +1010,8 @@ ro2rw_convert_to_rw() {
                 ;;
             "f2fs")
                 log "  Handling F2FS: ${name}"
-                local size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+                local size
+                size="$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null)"
                 local mnt_point="${MOUNT_ROOT}/mnt_${name}"
                 mkdir -p "${mnt_point}"
                 
@@ -838,7 +1032,8 @@ ro2rw_convert_to_rw() {
                 fi
                 
                 # Get actual uncompressed size
-                local uncompressed_kb=$(${BB} du -sk "${mnt_point}" 2>/dev/null | ${BB} awk '{print $1}')
+                local uncompressed_kb
+                uncompressed_kb="$(${BB:+$BB }du -sk "${mnt_point}" 2>/dev/null | ${BB:+$BB }awk '{print $1}')"
                 [ -z "${uncompressed_kb}" ] && uncompressed_kb=$((size / 1024))
                 # Use original partition size when available, else compute
                 local _part_name="${name%.*}"
@@ -848,7 +1043,7 @@ ro2rw_convert_to_rw() {
                 if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
                     new_size="${_orig_size}"
                 else
-                    new_size=$(${BB} awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.10 + 52428800 }')
+                    new_size=$(${BB:+$BB }awk -v kb="${uncompressed_kb}" 'BEGIN { printf "%.0f\n", (kb * 1024) * 1.10 + 52428800 }')
                 fi
                 
                 if [ ${mounted} -eq 1 ]; then
@@ -865,7 +1060,7 @@ ro2rw_convert_to_rw() {
                     [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
 
                     # Keep raw (non-sparse) — lpmake needs fstat-able files
-                    ${BB} mv -f "${raw_img}" "${img}"
+                    ${BB:+$BB }mv -f "${raw_img}" "${img}"
                     converted=1
                     log "  Converted ${name} from F2FS to EXT4"
                 else
@@ -901,7 +1096,7 @@ ro2rw_convert_to_rw() {
                 
                 if [ ${needs_tuning} -eq 1 ]; then
                     local size
-                    size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+                    size=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null)
                     local _part_name="${name%.*}"
                     local _orig_size
                     _orig_size=$(ro2rw_get_orig_size "${_part_name}" "${orig_sizes_str}")
@@ -909,7 +1104,7 @@ ro2rw_convert_to_rw() {
                     if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
                         new_size="${_orig_size}"
                     else
-                        new_size=$(${BB} awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
+                        new_size=$(${BB:+$BB }awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
                     fi
                     
                     local loop_dev=""
@@ -946,7 +1141,7 @@ ro2rw_convert_to_rw() {
                         fi
 
                         # Keep raw (non-sparse) — lpmake needs fstat-able files
-                        ${BB} mv -f "${raw_img}" "${img}"
+                        ${BB:+$BB }mv -f "${raw_img}" "${img}"
                         converted=1
                     else
                         log "  Cannot mount EXT4 natively for tuning, skipping"
@@ -956,7 +1151,7 @@ ro2rw_convert_to_rw() {
                 rm -rf "${mnt_point}"
                 ;;
             *)
-                if ${BB} strings "${img}" 2>/dev/null | head -5 | grep -q "ext4" 2>/dev/null; then
+                if ${BB:+$BB }strings "${img}" 2>/dev/null | head -5 | grep -q "ext4" 2>/dev/null; then
                     log "  Detected as EXT4 by signature: ${name}"
                 else
                     log "  Unknown fstype, skipping: ${name}"
@@ -1063,17 +1258,17 @@ ro2rw_build_new_super() {
         # lpdump does not print the super block size; logical partitions always
         # use 4096-byte sectors, so just default to it.
         block_size=4096
-        super_name=$(${BB} grep -m1 "Partition name:" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
+        super_name=$(${BB:+$BB }grep -m1 "Partition name:" "${metadata_file}" 2>/dev/null | ${BB:+$BB }awk '{print $NF}' || true)
         [ -z "${super_name}" ] && super_name="super"
-        metadata_slots=$(${BB} grep -m1 "Metadata slot count" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $NF}' || true)
+        metadata_slots=$(${BB:+$BB }grep -m1 "Metadata slot count" "${metadata_file}" 2>/dev/null | ${BB:+$BB }awk '{print $NF}' || true)
         [ -z "${metadata_slots}" ] && metadata_slots="3"
-        metadata_max_size=$(${BB} grep -m1 "Metadata max size" "${metadata_file}" 2>/dev/null | ${BB} awk '{print $(NF-1)}' || true)
+        metadata_max_size=$(${BB:+$BB }grep -m1 "Metadata max size" "${metadata_file}" 2>/dev/null | ${BB:+$BB }awk '{print $(NF-1)}' || true)
         [ -z "${metadata_max_size}" ] && metadata_max_size="65536"
     fi
 
     # Get total super size
     local total_size
-    total_size=$(${BB} stat -c%s "${OUTPUTDIR}/super_original.img" 2>/dev/null || true)
+    total_size=$(${BB:+$BB }stat -c%s "${OUTPUTDIR}/super_original.img" 2>/dev/null || true)
     if [ -z "${total_size}" ]; then
         die "Failed to get size of ${OUTPUTDIR}/super_original.img"
     fi
@@ -1096,20 +1291,20 @@ ro2rw_build_new_super() {
     local _total_parts=0
     for img in "${extract_dir}"/*.img; do
         [ -f "${img}" ] || continue
-        _sz=$(${BB} stat -c%s "${img}" 2>/dev/null || echo 0)
-        _total_parts=$(${BB} awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
+        _sz=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null || echo 0)
+        _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
     done
     # Reserve space for metadata: slots * max_size * 2 (primary+backup) + 1MB headroom
     local _meta_reserve
-    _meta_reserve=$(${BB} awk -v slots="${metadata_slots}" -v ms="${metadata_max_size}"         'BEGIN{printf "%d", slots*ms*2 + 1048576}')
+    _meta_reserve=$(${BB:+$BB }awk -v slots="${metadata_slots}" -v ms="${metadata_max_size}"         'BEGIN{printf "%d", slots*ms*2 + 1048576}')
     local _budget
-    _budget=$(${BB} awk -v ts="${total_size}" -v mr="${_meta_reserve}"         'BEGIN{printf "%d", ts - mr}')
+    _budget=$(${BB:+$BB }awk -v ts="${total_size}" -v mr="${_meta_reserve}"         'BEGIN{printf "%d", ts - mr}')
     if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
         log "WARNING: Partition images total ${_total_parts} bytes, but super budget is ${_budget} bytes."
         log "         Shrinking ext4 images to their minimum size..."
         for img in "${extract_dir}"/*.img; do
             [ -f "${img}" ] || continue
-            _iname=$(${BB} basename "${img}")
+            _iname=$(${BB:+$BB }basename "${img}")
             e2fsck -fy "${img}" >/dev/null 2>&1 || true
             # resize2fs -M shrinks the filesystem AND the file to its minimum.
             resize2fs -M "${img}" >/dev/null 2>&1 || log "  WARNING: could not shrink ${_iname} to minimum"
@@ -1118,8 +1313,8 @@ ro2rw_build_new_super() {
         _total_parts=0
         for img in "${extract_dir}"/*.img; do
             [ -f "${img}" ] || continue
-            _sz=$(${BB} stat -c%s "${img}" 2>/dev/null || echo 0)
-            _total_parts=$(${BB} awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
+            _sz=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null || echo 0)
+            _total_parts=$(${BB:+$BB }awk -v a="${_total_parts}" -v b="${_sz}" 'BEGIN{printf "%d", a+b}')
         done
         if [ "${_total_parts}" -gt "${_budget}" ] 2>/dev/null; then
             die "Decompressed images (${_total_parts} bytes) still exceed the super budget (${_budget} bytes) after shrinking. The super partition is too small to hold the ext4 filesystems; a device-specific smaller image layout is required."
@@ -1132,10 +1327,10 @@ ro2rw_build_new_super() {
     for img in "${extract_dir}"/*.img; do
         [ -f "${img}" ] || continue
         local name
-        name=$(${BB} basename "${img}" .img)
+        name=$(${BB:+$BB }basename "${img}" .img)
         # Always use actual file size so declared size == image size
         local size
-        size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+        size=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null)
         [ -z "${size}" ] || [ "${size}" -eq 0 ] 2>/dev/null && continue
 
         local orig_group
@@ -1175,13 +1370,14 @@ ro2rw_build_new_super() {
     # Execute lpmake
     ${cmd} 2>&1 | log || {
         log "lpmake failed (likely SD card fstat issue), retrying with internal storage..."
-        # Copy images to internal /data which supports fstat properly
-        local local_img_dir="/data/local/tmp/superrw/lpmake_images"
+        # Copy images to INTERNAL_TMP which supports fstat properly
+        local local_img_dir
+        local_img_dir=$(_tmpf "lpmake_images")
         rm -rf "${local_img_dir}"
         mkdir -p "${local_img_dir}"
         for _src in "${extract_dir}"/*.img; do
             [ -f "${_src}" ] || continue
-            ${BB} cp "${_src}" "${local_img_dir}/" 2>/dev/null ||                 dd if="${_src}" of="${local_img_dir}/$(${BB} basename "${_src}")" bs=1M 2>/dev/null || true
+            ${BB:+$BB }cp "${_src}" "${local_img_dir}/" 2>/dev/null ||                 dd if="${_src}" of="${local_img_dir}/$(${BB:+$BB }basename "${_src}")" bs=1M 2>/dev/null || true
         done
         # Build --partition and --image args in two passes (lpmake requires this order)
         local local_part_args=""
@@ -1189,9 +1385,9 @@ ro2rw_build_new_super() {
         for img in "${local_img_dir}"/*.img; do
             [ -f "${img}" ] || continue
             local name
-            name=$(${BB} basename "${img}" .img)
+            name=$(${BB:+$BB }basename "${img}" .img)
             local size
-            size=$(${BB} stat -c%s "${img}" 2>/dev/null)
+            size=$(${BB:+$BB }stat -c%s "${img}" 2>/dev/null)
             [ -z "${size}" ] || [ "${size}" -eq 0 ] 2>/dev/null && continue
             local_part_args="${local_part_args} --partition ${name}:none:${size}:default"
             local_img_args="${local_img_args} --image ${name}=${img}"
@@ -1225,13 +1421,25 @@ ro2rw_flash_super() {
     # Refuse to flash an image larger than the target — dd would corrupt the
     # super partition and could brick the device.
     local _img_size _tgt_size
-    _img_size=$(${BB} stat -c%s "${super_img}" 2>/dev/null || echo 0)
+    _img_size=$(${BB:+$BB }stat -c%s "${super_img}" 2>/dev/null || echo 0)
     _tgt_size=$(blockdev --getsize64 "${SUPER_BLOCK}" 2>/dev/null || echo 0)
     if [ "${_tgt_size}" -gt 0 ] 2>/dev/null && [ "${_img_size}" -gt "${_tgt_size}" ] 2>/dev/null; then
         die "Refusing to flash: image is ${_img_size} bytes but super is only ${_tgt_size} bytes."
     fi
 
-    echo -n "This will OVERWRITE ${SUPER_BLOCK} with ${super_img} — continue? [y/N]: "
+    # Image targets (Linux / SUPERRW_SUPER_IMG) are not writable partitions, so
+    # dd would just fail — print manual instructions instead of prompting.
+    if [ ! -b "${SUPER_BLOCK}" ]; then
+        log "SKIP: ${SUPER_BLOCK} is not a block device — cannot flash directly from this environment."
+        log "Flash manually instead:"
+        log "  fastboot flash super ${super_img}"
+        log "  fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img"
+        log "  fastboot reboot"
+        log "After flashing, wipe data and reboot."
+        return 1
+    fi
+
+    printf '%s' "This will OVERWRITE ${SUPER_BLOCK} with ${super_img} — continue? [y/N]: "
     read -r _flash_ans
     case "${_flash_ans}" in
         [Yy]*) ;;
@@ -1256,9 +1464,8 @@ ro2rw_flash_super() {
 }
 
 ro2rw_convert() {
-    local extra_size="${1:-0}"
-    local do_dfe="${2:-0}"
-    local skip_backup="${3:-0}"
+    local do_dfe="${1:-0}"
+    local skip_backup="${2:-0}"
 
     log "============================================"
     log "  RO2RW - Super Partition Conversion"
@@ -1276,7 +1483,7 @@ ro2rw_convert() {
     if [ "${skip_backup}" = "1" ]; then
         log "Skipping backup (--skip-backup requested)"
     elif [ -f "${backup_img}" ]; then
-        echo -n "Backup already exists at ${backup_img}. Overwrite? [y/N]: "
+        printf '%s' "Backup already exists at ${backup_img}. Overwrite? [y/N]: "
         read -r _bak_ans
         case "${_bak_ans}" in
             [Yy]*) log "Backing up original super to ${backup_img}..."
@@ -1333,13 +1540,18 @@ ro2rw_convert() {
 # Main Execution
 ###############################################################################
 main() {
-    # Check root
+    # Root is only meaningful on Android (su shell). On Linux the tool works
+    # unprivileged for image-file builds; mounting/flashing still needs root.
     if [ "$(id -u)" -ne 0 ]; then
-        echo "FATAL: This script must be run as root (su)"
-        exit 1
+        if [ "${IS_ANDROID}" = "1" ]; then
+            echo "FATAL: This script must be run as root (su)"
+            exit 1
+        fi
+        log "WARNING: not running as root — loop mounts and flashing will be skipped"
     fi
 
-    # Initialize workspace based on user choice
+    # Initialize workspace: Android keeps its interactive menu, Linux/Termux
+    # defaults to BASE_TMP (interactive when stdin is a tty).
     setup_workspace
 
     log "============================================"
@@ -1357,7 +1569,7 @@ main() {
     if [ -f "${BACKUPDIR}/super_backup.img" ]; then
         echo ""
         echo "Existing backup found: ${BACKUPDIR}/super_backup.img"
-        echo -n "Skip backup step to save time? [Y/n]: "
+        printf '%s' "Skip backup step to save time? [Y/n]: "
         read -r _skip_ans
         case "${_skip_ans}" in
             [Nn]*) _skip_backup="0" ;;
@@ -1365,7 +1577,7 @@ main() {
         esac
     else
         echo ""
-        echo -n "Skip backup step? (not recommended for first run) [y/N]: "
+        printf '%s' "Skip backup step? (not recommended for first run) [y/N]: "
         read -r _skip_ans
         case "${_skip_ans}" in
             [Yy]*) _skip_backup="1" ;;
@@ -1385,7 +1597,7 @@ main() {
     echo "  5) Restore original super from backup"
     echo "  6) Exit"
     echo "============================================"
-    echo -n "Select option [1-6]: "
+    printf '%s' "Select option [1-6]: "
 
     read -r choice
 
@@ -1395,12 +1607,12 @@ main() {
             log "DFE completed. Reboot recommended."
             ;;
         2)
-            ro2rw_convert "0" "0" "${_skip_backup}"
+            ro2rw_convert "0" "${_skip_backup}"
             log "RO2RW completed. Flash the new super and reboot."
             ;;
         3)
             log "Starting DFE + RO2RW..."
-            ro2rw_convert "0" "1" "${_skip_backup}"
+            ro2rw_convert "1" "${_skip_backup}"
             log "Both DFE and RO2RW completed."
             log "Flash the new super image and reboot."
             ;;
@@ -1411,14 +1623,14 @@ main() {
                 if [ -f "${_img}" ]; then
                     _img_count=$((_img_count + 1))
                     _img_list="${_img_list}${_img_list:+ }${_img}"
-                    echo "  ${_img_count}) ${_img} ($(${BB} du -h "${_img}" | ${BB} awk '{print $1}'))"
+                    echo "  ${_img_count}) ${_img} ($(${BB:+$BB }du -h "${_img}" | ${BB:+$BB }awk '{print $1}'))"
                 fi
             done
             if [ "${_img_count}" -eq 0 ]; then
                 log "No RW super images found in ${OUTPUTDIR}"
                 log "Please place the image file in ${OUTPUTDIR}"
             else
-                echo -n "Select image [1-${_img_count}]: "
+                printf '%s' "Select image [1-${_img_count}]: "
                 read -r _img_choice
                 _idx=0
                 _chosen=""
