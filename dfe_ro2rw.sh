@@ -70,12 +70,41 @@ export ARCH
 ###############################################################################
 # Logging & Utilities
 ###############################################################################
+# Terminal palette — display only, ${LOGFILE} always receives plain text.
+# One capped set of styles: section titles, dim rules, menu numbers, prompts,
+# success, warning and error. Every value stays empty (plain output) when
+# stdout or stderr is not a tty, when NO_COLOR is set, or when TERM=dumb.
+C_HDR="" C_RULE="" C_NUM="" C_PROMPT="" C_OK="" C_WARN="" C_ERR="" C_OFF=""
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR+set}" ] && [ "${TERM:-}" != "dumb" ]; then
+    _esc=$(printf '\033')
+    C_HDR="${_esc}[1;36m"     # bold cyan    — section titles
+    C_RULE="${_esc}[2m"       # dim          — separators
+    C_NUM="${_esc}[1;34m"     # bold blue    — menu numbers
+    C_PROMPT="${_esc}[1;35m"  # bold magenta — questions to answer
+    C_OK="${_esc}[1;32m"      # bold green   — success
+    C_WARN="${_esc}[1;33m"    # bold yellow  — warnings, skipped steps
+    C_ERR="${_esc}[1;31m"     # bold red     — fatal, invalid input
+    C_OFF="${_esc}[0m"
+    unset _esc
+fi
+
 log() {
-    local msg
+    local msg style="${_LOG_STYLE:-}"
+    _LOG_STYLE=""
+    # Colour is applied to the terminal copy only; the file copy below always
+    # gets the uncoloured line.
+    if [ -z "${style}" ] && [ $# -gt 0 ]; then
+        case "$*" in
+            *FATAL*|*ERROR*|*Invalid*|*Refusing*|*failed*|*Failed*) style="${C_ERR}" ;;
+            *WARNING*|*WARN*|*SKIP*)                                style="${C_WARN}" ;;
+            *completed*|*created*|*Created*|*successfully*)         style="${C_OK}" ;;
+            *====*)                                                 style="${C_RULE}" ;;
+        esac
+    fi
     if [ $# -gt 0 ]; then
         msg="[$(date '+%H:%M:%S')] $*"
         echo "${msg}" >> "${LOGFILE}" 2>/dev/null || true
-        echo "${msg}" >&2
+        printf '%s%s%s\n' "${style}" "${msg}" "${C_OFF}" >&2
     else
         while IFS= read -r line; do
             msg="[$(date '+%H:%M:%S')] ${line}"
@@ -83,6 +112,12 @@ log() {
             echo "${msg}" >&2
         done
     fi
+}
+
+# Section titles: same line in ${LOGFILE}, header colour on the terminal.
+log_title() {
+    _LOG_STYLE="${C_HDR}"
+    log "$@"
 }
 
 die() {
@@ -263,14 +298,15 @@ setup_workspace() {
     local choose="${BASE_TMP}"
     if [ -t 0 ] && [ -z "${SUPERRW_NONINTERACTIVE:-}" ]; then
         echo ""
-        echo "============================================"
-        echo "  Workspace Storage Location"
-        echo "============================================"
-        printf '%s' "Workspace directory [${BASE_TMP}]: "
+        echo "${C_HDR}  Workspace Storage Location${C_OFF}"
+        echo "${C_RULE}  ==========================================${C_OFF}"
+        echo ""
+        printf '%s' "${C_PROMPT}  Workspace directory [${BASE_TMP}]: ${C_OFF}"
         read -r _ws_dir
         if [ -n "${_ws_dir}" ]; then
             choose="${_ws_dir}"
         fi
+        echo ""
     fi
 
     TMPDIR="${choose}"
@@ -308,18 +344,21 @@ _setup_workspace_android() {
     ext_sd=$(find_external_sdcard)
 
     echo ""
-    echo "============================================"
-    echo "  Workspace Storage Location"
-    echo "============================================"
-    echo "  1) Internal Data (${BASE_TMP}) [Recommended, Fast]"
-    echo "  2) Internal Storage (/sdcard/superrw)"
-    
+    echo "${C_HDR}  Workspace Storage Location${C_OFF}"
+    echo "${C_RULE}  ==========================================${C_OFF}"
+    echo ""
+    echo "    ${C_NUM}1${C_OFF}) Internal Data (${BASE_TMP}) [Recommended, Fast]"
+    echo "    ${C_NUM}2${C_OFF}) Internal Storage (/sdcard/superrw)"
+
     if [ -n "${ext_sd}" ]; then
-        echo "  3) External MicroSD Card (${ext_sd}/superrw)"
+        echo ""
+        echo "    ${C_NUM}3${C_OFF}) External MicroSD Card (${ext_sd}/superrw)"
     fi
-    
-    printf '%s' "Select option: "
+
+    echo ""
+    printf '%s' "${C_PROMPT}  Select option: ${C_OFF}"
     read -r ws_choice
+    echo ""
 
     if [ "${ws_choice}" = "3" ] && [ -n "${ext_sd}" ]; then
         TMPDIR="${ext_sd}/superrw"
@@ -686,16 +725,21 @@ dfe_hide_encrypted_flag() {
 
 dfe_disable_encryption_live() {
     if [ "${IS_ANDROID}" != "1" ]; then
-        log "============================================"
-        log "  Disable Force Encryption (DFE) - Live"
-        log "============================================"
+        echo ""
+        log "  =========================================="
+        log_title "  Disable Force Encryption (DFE) - Live"
+        log "  =========================================="
+        echo ""
         log "SKIP: live DFE requires Android (live remounts, /dev/block boot writes, resetprop)."
         log "      On Linux, use menu option 3 (DFE + RO2RW) to patch the partition images."
+        echo ""
         return 0
     fi
-    log "============================================"
-    log "  Disable Force Encryption (DFE) - Live"
-    log "============================================"
+    echo ""
+    log "  =========================================="
+    log_title "  Disable Force Encryption (DFE) - Live"
+    log "  =========================================="
+    echo ""
 
     # Remount vendor as RW first
     local vendor_dev=""
@@ -1172,9 +1216,17 @@ ro2rw_convert_to_rw() {
                         rm -f "${mnt_point}/.rw_test"
                         log "  ${name} is already RW-compatible"
                         if [ "${do_dfe}" = "1" ]; then
-                            log "  Applying DFE to ${name}..."
-                            dfe_patch_fstabs_in_dir "${mnt_point}"
-                            dfe_patch_rc_in_dir "${mnt_point}"
+                            # Check free space before patching — if full, rebuild with headroom
+                            local _free_kb
+                            _free_kb=$(${BB:+$BB }df -k "${mnt_point}" 2>/dev/null | ${BB:+$BB }awk 'NR==2 {print $4}')
+                            if [ -n "${_free_kb}" ] && [ "${_free_kb}" -lt 1024 ]; then
+                                log "  ${name} has low free space (${_free_kb} KB), rebuilding with headroom..."
+                                needs_tuning=1
+                            else
+                                log "  Applying DFE to ${name}..."
+                                dfe_patch_fstabs_in_dir "${mnt_point}"
+                                dfe_patch_rc_in_dir "${mnt_point}"
+                            fi
                         fi
                         umount -fl "${mnt_point}" 2>/dev/null || true
                     } || {
@@ -1498,9 +1550,11 @@ ro2rw_build_new_super() {
 ro2rw_flash_super() {
     local super_img="$1"
 
-    log "============================================"
-    log "  Preparing to flash new super image"
-    log "============================================"
+    echo ""
+    log "  =========================================="
+    log_title "  Preparing to flash new super image"
+    log "  =========================================="
+    echo ""
     log "Image: ${super_img}"
     log "Target: ${SUPER_BLOCK}"
 
@@ -1532,12 +1586,14 @@ ro2rw_flash_super() {
         return 1
     fi
 
-    printf '%s' "This will OVERWRITE ${SUPER_BLOCK} with ${super_img} — continue? [y/N]: "
+    echo ""
+    printf '%s' "${C_PROMPT}This will OVERWRITE ${SUPER_BLOCK} with ${super_img} — continue? [y/N]: ${C_OFF}"
     read -r _flash_ans
     case "${_flash_ans}" in
         [Yy]*) ;;
         *) log "Flash cancelled by user."; return 1 ;;
     esac
+    echo ""
 
     # Direct dd flash (works if bootloader is unlocked and partition is writable)
     log "Attempting direct flash..."
@@ -1560,9 +1616,11 @@ ro2rw_convert() {
     local do_dfe="${1:-0}"
     local skip_backup="${2:-0}"
 
-    log "============================================"
-    log "  RO2RW - Super Partition Conversion"
-    log "============================================"
+    echo ""
+    log "  =========================================="
+    log_title "  RO2RW - Super Partition Conversion"
+    log "  =========================================="
+    echo ""
 
     # Dump super
     local super_img
@@ -1576,7 +1634,8 @@ ro2rw_convert() {
     if [ "${skip_backup}" = "1" ]; then
         log "Skipping backup (--skip-backup requested)"
     elif [ -f "${backup_img}" ]; then
-        printf '%s' "Backup already exists at ${backup_img}. Overwrite? [y/N]: "
+        echo ""
+        printf '%s' "${C_PROMPT}Backup already exists at ${backup_img}. Overwrite? [y/N]: ${C_OFF}"
         read -r _bak_ans
         case "${_bak_ans}" in
             [Yy]*) log "Backing up original super to ${backup_img}..."
@@ -1584,6 +1643,7 @@ ro2rw_convert() {
                    log "Backup created" ;;
             *)     log "Keeping existing backup." ;;
         esac
+        echo ""
     else
         log "Backing up original super to ${backup_img}..."
         cp "${super_img}" "${backup_img}"
@@ -1637,7 +1697,7 @@ main() {
     # unprivileged for image-file builds; mounting/flashing still needs root.
     if [ "$(id -u)" -ne 0 ]; then
         if [ "${IS_ANDROID}" = "1" ]; then
-            echo "FATAL: This script must be run as root (su)"
+            echo "${C_ERR}FATAL: This script must be run as root (su)${C_OFF}"
             exit 1
         fi
         log "WARNING: not running as root — loop mounts and flashing will be skipped"
@@ -1647,10 +1707,12 @@ main() {
     # defaults to BASE_TMP (interactive when stdin is a tty).
     setup_workspace
 
-    log "============================================"
-    log "  DFE + RO2RW Universal Script"
-    log "  Starting at $(date)"
-    log "============================================"
+    echo ""
+    log "  =========================================="
+    log_title "  DFE + RO2RW Universal Script"
+    log_title "  Starting at $(date)"
+    log "  =========================================="
+    echo ""
 
     # Setup
     get_current_slot
@@ -1661,8 +1723,10 @@ main() {
     _skip_backup="0"
     if [ -f "${BACKUPDIR}/super_backup.img" ]; then
         echo ""
-        echo "Existing backup found: ${BACKUPDIR}/super_backup.img"
-        printf '%s' "Skip backup step to save time? [Y/n]: "
+        echo "${C_HDR}  Existing backup found:${C_OFF}"
+        echo "    ${BACKUPDIR}/super_backup.img"
+        echo ""
+        printf '%s' "${C_PROMPT}  Skip backup step to save time? [Y/n]: ${C_OFF}"
         read -r _skip_ans
         case "${_skip_ans}" in
             [Nn]*) _skip_backup="0" ;;
@@ -1670,29 +1734,33 @@ main() {
         esac
     else
         echo ""
-        printf '%s' "Skip backup step? (not recommended for first run) [y/N]: "
+        printf '%s' "${C_PROMPT}  Skip backup step? (not recommended for first run) [y/N]: ${C_OFF}"
         read -r _skip_ans
         case "${_skip_ans}" in
             [Yy]*) _skip_backup="1" ;;
             *)     _skip_backup="0" ;;
         esac
     fi
+    echo ""
 
     # Menu
     echo ""
-    echo "============================================"
-    echo "  DFE + RO2RW Tool"
-    echo "============================================"
-    echo "  1) Disable Force Encryption (DFE only)"
-    echo "  2) RO2RW (convert super to read-write)"
-    echo "  3) DFE + RO2RW (both)"
-    echo "  4) Flash existing RW super image"
-    echo "  5) Restore original super from backup"
-    echo "  6) Exit"
-    echo "============================================"
-    printf '%s' "Select option [1-6]: "
+    echo "${C_HDR}  DFE + RO2RW Tool${C_OFF}"
+    echo "${C_RULE}  ==========================================${C_OFF}"
+    echo ""
+    echo "    ${C_NUM}1${C_OFF}) Disable Force Encryption (DFE only)"
+    echo "    ${C_NUM}2${C_OFF}) RO2RW (convert super to read-write)"
+    echo "    ${C_NUM}3${C_OFF}) DFE + RO2RW (both)"
+    echo ""
+    echo "    ${C_NUM}4${C_OFF}) Flash existing RW super image"
+    echo "    ${C_NUM}5${C_OFF}) Restore original super from backup"
+    echo ""
+    echo "    ${C_NUM}6${C_OFF}) Exit"
+    echo ""
+    printf '%s' "${C_PROMPT}  Select option [1-6]: ${C_OFF}"
 
     read -r choice
+    echo ""
 
     case "${choice}" in
         1)
@@ -1710,21 +1778,27 @@ main() {
             log "Flash the new super image and reboot."
             ;;
          4)
+            echo ""
+            echo "${C_HDR}  RW super images (${OUTPUTDIR})${C_OFF}"
+            echo "${C_RULE}  ==========================================${C_OFF}"
+            echo ""
             _img_list=""
             _img_count=0
             for _img in "${OUTPUTDIR}"/super_rw*.img; do
                 if [ -f "${_img}" ]; then
                     _img_count=$((_img_count + 1))
                     _img_list="${_img_list}${_img_list:+ }${_img}"
-                    echo "  ${_img_count}) ${_img} ($(${BB:+$BB }du -h "${_img}" | ${BB:+$BB }awk '{print $1}'))"
+                    echo "    ${C_NUM}${_img_count}${C_OFF}) ${_img} ($(${BB:+$BB }du -h "${_img}" | ${BB:+$BB }awk '{print $1}'))"
                 fi
             done
             if [ "${_img_count}" -eq 0 ]; then
                 log "No RW super images found in ${OUTPUTDIR}"
                 log "Please place the image file in ${OUTPUTDIR}"
             else
-                printf '%s' "Select image [1-${_img_count}]: "
+                echo ""
+                printf '%s' "${C_PROMPT}  Select image [1-${_img_count}]: ${C_OFF}"
                 read -r _img_choice
+                echo ""
                 _idx=0
                 _chosen=""
                 for _img in ${_img_list}; do
@@ -1759,10 +1833,12 @@ main() {
             ;;
     esac
 
-    log "============================================"
-    log "  Script completed at $(date)"
-    log "  Log: ${LOGFILE}"
-    log "============================================"
+    echo ""
+    log "  =========================================="
+    log_title "  Script completed at $(date)"
+    log_title "  Log: ${LOGFILE}"
+    log "  =========================================="
+    echo ""
 }
 
 main "$@"

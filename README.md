@@ -61,16 +61,17 @@ This tool aims to simplify the process of making system partitions modifiable an
    
    Then, you will see the main menu:
    ```text
-   ============================================
      DFE + RO2RW Tool
-   ============================================
-     1) Disable Force Encryption (DFE only)
-     2) RO2RW (convert super to read-write)
-     3) DFE + RO2RW (both)
-     4) Flash existing RW super image
-     5) Restore original super from backup
-     6) Exit
-   ============================================
+     ==========================================
+
+       1) Disable Force Encryption (DFE only)
+       2) RO2RW (convert super to read-write)
+       3) DFE + RO2RW (both)
+
+       4) Flash existing RW super image
+       5) Restore original super from backup
+
+       6) Exit
    ```
    Select your desired option. 
 
