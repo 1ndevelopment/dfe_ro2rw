@@ -1246,7 +1246,10 @@ ro2rw_convert_to_rw() {
                     _orig_size=$(ro2rw_get_orig_size "${_part_name}" "${orig_sizes_str}")
                     local new_size
                     if [ -n "${_orig_size}" ] && [ "${_orig_size}" -gt 0 ] 2>/dev/null; then
-                        new_size="${_orig_size}"
+                        # Rebuilding at the exact orig size leaves zero free
+                        # blocks once ext4 journal/inode tables land on it, so
+                        # add the same headroom as the no-orig-size fallback.
+                        new_size=$(${BB:+$BB }awk -v s="${_orig_size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
                     else
                         new_size=$(${BB:+$BB }awk -v s="${size}" 'BEGIN { printf "%.0f\n", s + s/10 + 52428800 }')
                     fi
@@ -1268,25 +1271,31 @@ ro2rw_convert_to_rw() {
                     
                     if [ ${mounted} -eq 1 ]; then
                         local raw_img="${extract_dir}/${name%.*}.raw.ext4"
-                        make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" 2>&1 | log || true
+                        make_ext4fs -l "${new_size}" "${raw_img}" "${mnt_point}" >"${WORKDIR}/_mkfs_${name%.*}.log" 2>&1 && _mkok=0 || _mkok=$?
+                        cat "${WORKDIR}/_mkfs_${name%.*}.log" | log || true
                         umount -fl "${mnt_point}" 2>/dev/null || true
                         [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
                         
-                        if [ "${do_dfe}" = "1" ]; then
-                            local rw_mnt="${MOUNT_ROOT}/rw_${name}"
-                            mkdir -p "${rw_mnt}"
-                            if mount -t ext4 -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null || mount -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null; then
-                                log "  Applying DFE to ${name}..."
-                                dfe_patch_fstabs_in_dir "${rw_mnt}"
-                                dfe_patch_rc_in_dir "${rw_mnt}"
-                                umount -fl "${rw_mnt}" 2>/dev/null || true
+                        if [ ${_mkok} -eq 0 ] && [ -f "${raw_img}" ]; then
+                            if [ "${do_dfe}" = "1" ]; then
+                                local rw_mnt="${MOUNT_ROOT}/rw_${name}"
+                                mkdir -p "${rw_mnt}"
+                                if mount -t ext4 -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null || mount -o loop,rw "${raw_img}" "${rw_mnt}" 2>/dev/null; then
+                                    log "  Applying DFE to ${name}..."
+                                    dfe_patch_fstabs_in_dir "${rw_mnt}"
+                                    dfe_patch_rc_in_dir "${rw_mnt}"
+                                    umount -fl "${rw_mnt}" 2>/dev/null || true
+                                fi
+                                rm -rf "${rw_mnt}"
                             fi
-                            rm -rf "${rw_mnt}"
-                        fi
 
-                        # Keep raw (non-sparse) — lpmake needs fstat-able files
-                        ${BB:+$BB }mv -f "${raw_img}" "${img}"
-                        converted=1
+                            # Keep raw (non-sparse) — lpmake needs fstat-able files
+                            ${BB:+$BB }mv -f "${raw_img}" "${img}"
+                            converted=1
+                        else
+                            log "  WARNING: make_ext4fs failed for ${name}, keeping original image"
+                            rm -f "${raw_img}"
+                        fi
                     else
                         log "  Cannot mount EXT4 natively for tuning, skipping"
                         [ -n "${loop_dev}" ] && losetup -d "${loop_dev}" 2>/dev/null || true
